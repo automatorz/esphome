@@ -4,6 +4,7 @@
 #include "esphome/core/hal.h"
 #include "esphome/core/application.h"
 #include <cmath>
+#include <cstdio>
 
 namespace esphome { namespace shutter_hub {
 
@@ -118,6 +119,51 @@ void Shutter::publish_state_from_position() {
   if (p > 1.0f) p = 1.0f;
   this->position = p;
   this->publish_state();
+  this->publish_status();
+  this->publish_position_sensor();
+}
+
+void Shutter::publish_status() {
+  if (status_sensor_ == nullptr) return;
+
+  const char *status;
+  bool is_active = (hub_ != nullptr && hub_->active_shutter() == this);
+
+  if (is_active && this->current_operation == cover::COVER_OPERATION_OPENING) {
+    status = "opening";
+  } else if (is_active &&
+             this->current_operation == cover::COVER_OPERATION_CLOSING) {
+    status = "closing";
+  } else if (queued_ && queued_dir_ == Dir::UP) {
+    status = "queued_open";
+  } else if (queued_ && queued_dir_ == Dir::DOWN) {
+    status = "queued_close";
+  } else {
+    // Idle: derive from position.
+    float p = this->position_known ? this->position : 1.0f;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    if (p >= 0.99f) {
+      status = "open";
+    } else if (p <= 0.01f) {
+      status = "closed";
+    } else {
+      char buf[16];
+      int pct = (int) std::lroundf(p * 100.0f);
+      snprintf(buf, sizeof(buf), "partial:%d", pct);
+      status_sensor_->publish_state(buf);
+      return;
+    }
+  }
+  status_sensor_->publish_state(status);
+}
+
+void Shutter::publish_position_sensor() {
+  if (position_sensor_ == nullptr) return;
+  float p = this->position_known ? this->position : 1.0f;
+  if (p < 0.0f) p = 0.0f;
+  if (p > 1.0f) p = 1.0f;
+  position_sensor_->publish_state((float) std::lroundf(p * 100.0f));
 }
 
 void Shutter::publish_sun_through(bool on) {

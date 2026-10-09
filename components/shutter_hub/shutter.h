@@ -4,6 +4,8 @@
 #include "esphome/components/cover/cover.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
+#include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/components/sensor/sensor.h"
 #include <cstdint>
 
 namespace esphome { namespace shutter_hub {
@@ -33,6 +35,8 @@ class Shutter : public cover::Cover, public Component {
   void set_close_on_sun_through(bool v) { close_on_sun_through_ = v; }
   void set_restore(bool v) { restore_ = v; }
   void set_sun_through_sensor(binary_sensor::BinarySensor *b) { sun_through_sensor_ = b; }
+  void set_status_sensor(text_sensor::TextSensor *s) { status_sensor_ = s; }
+  void set_position_sensor(sensor::Sensor *s) { position_sensor_ = s; }
   void set_window(float w, float d, float h, WindowOrientation o, float margin) {
     window_.w = w; window_.d = d; window_.h = h;
     window_.o = o; window_.margin = margin;
@@ -54,6 +58,12 @@ class Shutter : public cover::Cover, public Component {
   void publish_state_from_position();
   void publish_sun_through(bool on);
 
+  // Telemetry: mark this shutter as queued (pending, not yet the active
+  // mover) so publish_status() can report queued_open / queued_close.
+  void set_queued(bool q, Dir d) { queued_ = q; queued_dir_ = d; }
+  void publish_status();
+  void publish_position_sensor();
+
   void save_position();
   void restore_position();
   void apply_loaded_position();   // <-- NEW
@@ -74,6 +84,10 @@ class Shutter : public cover::Cover, public Component {
   ShutterHub *hub_{nullptr};
   switch_::Switch *up_{nullptr}, *down_{nullptr};
   binary_sensor::BinarySensor *sun_through_sensor_{nullptr};
+  text_sensor::TextSensor *status_sensor_{nullptr};
+  sensor::Sensor *position_sensor_{nullptr};
+  bool queued_{false};
+  Dir  queued_dir_{Dir::NONE};
   size_t   index_{0};
   uint32_t travel_ms_{30000};
   bool open_at_sunrise_{false}, close_at_sunset_{false};

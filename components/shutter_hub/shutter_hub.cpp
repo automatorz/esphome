@@ -97,6 +97,11 @@ void ShutterHub::loop() {
     this->ensure_positions_loaded_();
     if (positions_loaded_) {
       for (auto *s : shutters_) s->apply_loaded_position();
+      // Shutters now have their restored positions and position_known=true.
+      // Re-aggregate every group so groups reflect the real state instead of
+      // the "open" default published from ShutterGroup::setup() (which ran
+      // before any position was known).
+      this->update_group_states();
     }
     return;
   }
@@ -162,8 +167,12 @@ void ShutterHub::begin_request_() {
   active_->current_operation = (r.dir == Dir::UP)
                                    ? cover::COVER_OPERATION_OPENING
                                    : cover::COVER_OPERATION_CLOSING;
+  // Now the active mover: clear any queued marker so status reports
+  // opening/closing rather than queued_*.
+  active_->set_queued(false, Dir::NONE);
   active_->energize(r.dir);
   active_->publish_state(false);
+  active_->publish_status();
   state_ = HubState::SETTLING;
   state_start_ms_ = millis();
 }
@@ -186,6 +195,8 @@ void ShutterHub::refresh_active_position_() {
   if ((uint32_t)(now - last_pos_publish_ms_) >= POS_PUBLISH_INTERVAL_MS) {
     last_pos_publish_ms_ = now;
     active_->publish_state(false);
+    active_->publish_status();
+    active_->publish_position_sensor();
     float delta = std::fabs(new_pos - last_group_update_pos_);
     if (delta >= GROUP_UPDATE_MIN_DELTA) {
       last_group_update_pos_ = new_pos;
@@ -213,11 +224,32 @@ void ShutterHub::enqueue(Shutter *s, Dir d, bool from_wall_switch) {
     stop_active();
   } else if (active_ != nullptr && from_wall_switch) {
     Request preempted{active_, active_dir_, false, true};
-    stop_active();
+    stop_active();  // resets preempted shutter's icon to IDLE
     queue_.push_front(preempted);
+    // Re-mark the preempted shutter as queued so it keeps showing its
+    // (resume) direction icon while it waits for its turn again.
+    preempted.shutter->current_operation =
+        (preempted.dir == Dir::UP) ? cover::COVER_OPERATION_OPENING
+                                   : cover::COVER_OPERATION_CLOSING;
+    preempted.shutter->set_queued(true, preempted.dir);
+    preempted.shutter->publish_state(false);
+    preempted.shutter->publish_status();
   }
   if (from_wall_switch) queue_.push_front({s, d, true, false});
   else                  queue_.push_back({s, d, false, false});
+
+  // Visual feedback: a shutter sitting in the queue (not yet the active one)
+  // immediately shows the opening/closing icon in HA, so a batch command makes
+  // it obvious which shutters have a movement pending. The icon matches the
+  // queued direction; begin_request_() keeps it set when the shutter becomes
+  // active, and complete_active_/stop_active/cancel reset it to IDLE.
+  if (active_ != s) {
+    s->current_operation = (d == Dir::UP) ? cover::COVER_OPERATION_OPENING
+                                          : cover::COVER_OPERATION_CLOSING;
+    s->set_queued(true, d);
+    s->publish_state(false);
+    s->publish_status();
+  }
 }
 
 void ShutterHub::stop_active() {
@@ -234,6 +266,7 @@ void ShutterHub::stop_active() {
     }
   }
   active_->current_operation = cover::COVER_OPERATION_IDLE;
+  active_->set_queued(false, Dir::NONE);
   active_->de_energize();
   active_->publish_state_from_position();
   active_->save_position();
@@ -252,11 +285,25 @@ void ShutterHub::stop_active() {
 }
 
 void ShutterHub::cancel_shutter(Shutter *s) {
-  if (active_ == s) stop_active();
+  bool was_active = (active_ == s);
+  if (was_active) stop_active();  // resets its icon to IDLE already
+  bool was_queued = false;
   queue_.erase(
       std::remove_if(queue_.begin(), queue_.end(),
-                     [s](const Request &r) { return r.shutter == s; }),
+                     [s, &was_queued](const Request &r) {
+                       if (r.shutter == s) { was_queued = true; return true; }
+                       return false;
+                     }),
       queue_.end());
+  // A shutter that was only queued (not active) was showing the pending
+  // opening/closing icon from enqueue(). Clear it back to IDLE and refresh
+  // its group so the UI doesn't leave it "closing" forever.
+  if (!was_active && was_queued) {
+    s->current_operation = cover::COVER_OPERATION_IDLE;
+    s->set_queued(false, Dir::NONE);
+    s->publish_state_from_position();
+    this->update_group_states_for(s);
+  }
 }
 
 void ShutterHub::cancel_group(ShutterGroup *g) {
@@ -269,6 +316,7 @@ void ShutterHub::complete_active_() {
   else                        active_->position = 0.0f;
   active_->position_known = true;
   active_->current_operation = cover::COVER_OPERATION_IDLE;
+  active_->set_queued(false, Dir::NONE);
   active_->de_energize();
   active_->publish_state_from_position();
   active_->save_position();
