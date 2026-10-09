@@ -1,0 +1,6 @@
+# Workflow / agent scratch artifacts
+.agents/
+**/.agents/
+
+# Local ESPHome config dumps
+esp.yaml
