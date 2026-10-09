@@ -88,21 +88,42 @@ void ShutterGroup::update_state(bool force) {
   this->publish_state();
 }
 
-void ShutterGroup::loop() {
-  bool u = up_btn_   != nullptr && up_btn_->state;
-  bool d = down_btn_ != nullptr && down_btn_->state;
+// Standard debounce: a raw reading must hold steady for >= debounce_ms_
+// before it is promoted to the stable value. Returns the stable value.
+bool ShutterGroup::debounce_(bool raw, bool &raw_prev, uint32_t &raw_changed_ms,
+                             bool &stable, uint32_t now) {
+  if (raw != raw_prev) {
+    raw_prev = raw;
+    raw_changed_ms = now;
+  } else if (raw != stable &&
+             (uint32_t)(now - raw_changed_ms) >= debounce_ms_) {
+    stable = raw;
+  }
+  return stable;
+}
 
-  if (u && !up_prev_)   on_press_(up_cs_, true);
-  if (d && !down_prev_) on_press_(down_cs_, false);
+void ShutterGroup::loop() {
+  const uint32_t now = millis();
+
+  bool u_raw = up_btn_   != nullptr && up_btn_->state;
+  bool d_raw = down_btn_ != nullptr && down_btn_->state;
+
+  // Feed the DEBOUNCED stable state into the edge/click detection below, so a
+  // noisy raw reading can't register as a spurious click.
+  bool u = debounce_(u_raw, up_raw_prev_, up_raw_changed_ms_, up_stable_, now);
+  bool d = debounce_(d_raw, down_raw_prev_, down_raw_changed_ms_, down_stable_,
+                     now);
+
+  if (u && !up_prev_)   on_press_(up_cs_, true, now);
+  if (d && !down_prev_) on_press_(down_cs_, false, now);
   up_prev_ = u;
   down_prev_ = d;
 
-  loop_click_(up_cs_, true);
-  loop_click_(down_cs_, false);
+  loop_click_(up_cs_, true, now);
+  loop_click_(down_cs_, false, now);
 }
 
-void ShutterGroup::on_press_(ClickState &cs, bool is_up) {
-  uint32_t now = millis();
+void ShutterGroup::on_press_(ClickState &cs, bool is_up, uint32_t now) {
   if (cs.count > 0 && (uint32_t)(now - cs.last_press_ms) > click_window_ms_) {
     cs.count = 0;
   }
@@ -114,9 +135,9 @@ void ShutterGroup::on_press_(ClickState &cs, bool is_up) {
   }
 }
 
-void ShutterGroup::loop_click_(ClickState &cs, bool is_up) {
+void ShutterGroup::loop_click_(ClickState &cs, bool is_up, uint32_t now) {
   if (cs.count == 0) return;
-  if ((uint32_t)(millis() - cs.last_press_ms) > click_window_ms_) {
+  if ((uint32_t)(now - cs.last_press_ms) > click_window_ms_) {
     fire_click_(cs.count, is_up);
     cs.count = 0;
   }

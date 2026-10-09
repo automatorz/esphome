@@ -9,7 +9,7 @@ from esphome.const import CONF_ID, CONF_NAME, CONF_DEVICE_CLASS
 from esphome.core import CORE, ID
 from esphome.helpers import sanitize, snake_case
 
-CODEOWNERS = ["@you"]
+CODEOWNERS = ["@automatorz"]
 DEPENDENCIES = ["sun"]
 AUTO_LOAD = ["cover", "binary_sensor", "text_sensor", "sensor"]
 
@@ -45,6 +45,7 @@ CONF_HEATING             = "heating_needed"
 CONF_WALL_UP             = "wall_up"
 CONF_WALL_DOWN           = "wall_down"
 CONF_CLICK_WIN           = "click_window"
+CONF_DEBOUNCE            = "debounce"
 CONF_RESTORE             = "restore"
 CONF_TIME_ID             = "time_id"
 CONF_STATUS_SENSOR       = "status_sensor"
@@ -89,6 +90,7 @@ GROUP_SCHEMA = cover.cover_schema(ShutterGroup).extend({
     cv.Optional(CONF_WALL_DOWN): cv.use_id(binary_sensor.BinarySensor),
     cv.Required(CONF_SHUTTERS): cv.ensure_list(cv.use_id(Shutter)),
     cv.Optional(CONF_CLICK_WIN, default="400ms"): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_DEBOUNCE, default="20ms"): cv.positive_time_period_milliseconds,
 })
 
 CONFIG_SCHEMA = cv.Schema({
@@ -187,6 +189,7 @@ async def to_code(config):
         if CONF_WALL_DOWN in g:
             cg.add(gv.set_wall_down(await cg.get_variable(g[CONF_WALL_DOWN])))
         cg.add(gv.set_click_window(g[CONF_CLICK_WIN]))
+        cg.add(gv.set_debounce(g[CONF_DEBOUNCE]))
         for sh in g[CONF_SHUTTERS]:
             cg.add(gv.add_shutter(await cg.get_variable(sh)))
         cg.add(var.add_group(gv))

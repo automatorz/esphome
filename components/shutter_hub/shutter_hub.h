@@ -18,12 +18,13 @@ struct Request {
   Shutter *shutter;
   Dir dir;
   bool from_wall_switch;
-  bool is_resume;
 };
 
 static constexpr size_t MAX_SHUTTER_POSITIONS = 32;
 struct ShutterPositionBlock {
   uint32_t magic;
+  uint16_t version;
+  uint16_t count;
   float positions[MAX_SHUTTER_POSITIONS];
 };
 
@@ -68,6 +69,7 @@ class ShutterHub : public Component {
 
   void begin_request_();
   void complete_active_();
+  void finalize_active_(Shutter *finished);
   void refresh_active_position_();
   void ensure_positions_loaded_();
 
@@ -79,7 +81,6 @@ class ShutterHub : public Component {
   Dir active_dir_{Dir::NONE};
   uint32_t active_duration_ms_{0};
   float    active_start_pos_{1.0f};
-  bool     active_was_resume_{false};
 
   uint32_t last_pos_publish_ms_{0};
   float    last_group_update_pos_{1.0f};

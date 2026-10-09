@@ -84,7 +84,10 @@ void Shutter::control(const cover::CoverCall &call) {
   }
   if (call.get_position().has_value()) {
     float p = *call.get_position();
-    Dir d = (p > this->position + 0.01f) ? Dir::UP : Dir::DOWN;
+    // Symmetric: a target at or above the current position opens (UP); a
+    // target below the current position closes (DOWN). The exact-equal case
+    // resolves to UP (open).
+    Dir d = (p >= this->position) ? Dir::UP : Dir::DOWN;
     this->apply_manual_command(d);
   }
 }
@@ -185,8 +188,10 @@ void Shutter::restore_position() {
 }
 
 bool Shutter::compute_sun_through_raw(float az, float el) const {
+  // NaN guard intentionally omitted: the sole caller,
+  // ShutterHub::sun_through_active(), already rejects NaN az/el before
+  // calling here, so a guard here would be provably redundant.
   if (!has_window_) return false;
-  if (std::isnan(az) || std::isnan(el)) return false;
   if (el <= 0.0f) return false;
   const float W = window_.w, D = window_.d, H = window_.h;
   const float HD_ratio = H / D;

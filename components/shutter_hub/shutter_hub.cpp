@@ -21,6 +21,7 @@ static constexpr uint32_t SETTLE_MS = 200;
 static constexpr uint32_t INTER_REQUEST_DELAY_MS = 2000;
 
 static constexpr uint32_t POSITIONS_MAGIC = 0x53485554;  // "SHUT"
+static constexpr uint16_t POSITIONS_VERSION = 1;
 static constexpr uint32_t POSITIONS_PREF_HASH = 0x5A00F00D;
 
 void ShutterHub::setup() {
@@ -39,6 +40,8 @@ void ShutterHub::ensure_positions_loaded_() {
       positions_block_.positions[i] = NAN;
     }
     positions_block_.magic = POSITIONS_MAGIC;
+    positions_block_.version = POSITIONS_VERSION;
+    positions_block_.count = MAX_SHUTTER_POSITIONS;
   }
 
   ShutterPositionBlock loaded;
@@ -59,7 +62,9 @@ void ShutterHub::ensure_positions_loaded_() {
   }
 
   positions_loaded_ = true;
-  if (loaded.magic == POSITIONS_MAGIC) {
+  if (loaded.magic == POSITIONS_MAGIC &&
+      loaded.version == POSITIONS_VERSION &&
+      loaded.count == MAX_SHUTTER_POSITIONS) {
     memcpy(&positions_block_, &loaded, sizeof(positions_block_));
     ESP_LOGI(TAG, "RESTORE: loaded positions block from NVS");
     for (size_t i = 0; i < shutters_.size() && i < MAX_SHUTTER_POSITIONS; i++) {
@@ -67,8 +72,16 @@ void ShutterHub::ensure_positions_loaded_() {
                (unsigned) i, positions_block_.positions[i]);
     }
   } else {
-    ESP_LOGW(TAG, "RESTORE: empty/invalid block (magic=0x%08X), starting fresh",
-             (unsigned) loaded.magic);
+    // Magic/version/count mismatch: either a never-written block or an
+    // incompatible older layout. A one-time reset of saved positions is
+    // intended here -- start fresh (positions_block_ already holds the
+    // freshly-initialized NaN defaults set above).
+    ESP_LOGW(TAG,
+             "RESTORE: block rejected (magic=0x%08X ver=%u count=%u, "
+             "expected magic=0x%08X ver=%u count=%u), starting fresh",
+             (unsigned) loaded.magic, (unsigned) loaded.version,
+             (unsigned) loaded.count, (unsigned) POSITIONS_MAGIC,
+             (unsigned) POSITIONS_VERSION, (unsigned) MAX_SHUTTER_POSITIONS);
   }
 }
 
@@ -93,6 +106,8 @@ void ShutterHub::set_shutter_position(size_t index, float value) {
 }
 
 void ShutterHub::loop() {
+  const uint32_t now = millis();
+
   if (!positions_loaded_) {
     this->ensure_positions_loaded_();
     if (positions_loaded_) {
@@ -127,17 +142,17 @@ void ShutterHub::loop() {
       break;
 
     case HubState::SETTLING:
-      if ((uint32_t)(millis() - state_start_ms_) >= SETTLE_MS) {
+      if ((uint32_t)(now - state_start_ms_) >= SETTLE_MS) {
         state_ = HubState::MOVING;
-        state_start_ms_ = millis();
-        last_pos_publish_ms_ = millis() - POS_PUBLISH_INTERVAL_MS;
+        state_start_ms_ = now;
+        last_pos_publish_ms_ = now - POS_PUBLISH_INTERVAL_MS;
         last_group_update_pos_ = active_start_pos_;
         if (active_ != nullptr) active_->publish_state(false);
       }
       break;
 
     case HubState::MOVING:
-      if ((uint32_t)(millis() - state_start_ms_) >= active_duration_ms_) {
+      if ((uint32_t)(now - state_start_ms_) >= active_duration_ms_) {
         this->complete_active_();
       } else {
         this->refresh_active_position_();
@@ -145,7 +160,7 @@ void ShutterHub::loop() {
       break;
 
     case HubState::COOLDOWN:
-      if ((uint32_t)(millis() - state_start_ms_) >= INTER_REQUEST_DELAY_MS) {
+      if ((uint32_t)(now - state_start_ms_) >= INTER_REQUEST_DELAY_MS) {
         state_ = HubState::IDLE;
       }
       break;
@@ -157,7 +172,6 @@ void ShutterHub::begin_request_() {
   queue_.pop_front();
   active_ = r.shutter;
   active_dir_ = r.dir;
-  active_was_resume_ = r.is_resume;
   active_start_pos_ = active_->position_known ? active_->position
                        : (r.dir == Dir::UP ? 0.0f : 1.0f);
   float target = (r.dir == Dir::UP) ? 1.0f : 0.0f;
@@ -179,7 +193,8 @@ void ShutterHub::begin_request_() {
 
 void ShutterHub::refresh_active_position_() {
   if (active_ == nullptr) return;
-  uint32_t elapsed = millis() - state_start_ms_;
+  const uint32_t now = millis();
+  uint32_t elapsed = now - state_start_ms_;
   float frac = active_duration_ms_ == 0 ? 1.0f
               : (float) elapsed / (float) active_duration_ms_;
   if (frac < 0.0f) frac = 0.0f;
@@ -191,7 +206,6 @@ void ShutterHub::refresh_active_position_() {
   active_->current_operation = (active_dir_ == Dir::UP)
                                    ? cover::COVER_OPERATION_OPENING
                                    : cover::COVER_OPERATION_CLOSING;
-  uint32_t now = millis();
   if ((uint32_t)(now - last_pos_publish_ms_) >= POS_PUBLISH_INTERVAL_MS) {
     last_pos_publish_ms_ = now;
     active_->publish_state(false);
@@ -223,7 +237,7 @@ void ShutterHub::enqueue(Shutter *s, Dir d, bool from_wall_switch) {
     if (active_dir_ == d) return;
     stop_active();
   } else if (active_ != nullptr && from_wall_switch) {
-    Request preempted{active_, active_dir_, false, true};
+    Request preempted{active_, active_dir_, false};
     stop_active();  // resets preempted shutter's icon to IDLE
     queue_.push_front(preempted);
     // Re-mark the preempted shutter as queued so it keeps showing its
@@ -235,8 +249,8 @@ void ShutterHub::enqueue(Shutter *s, Dir d, bool from_wall_switch) {
     preempted.shutter->publish_state(false);
     preempted.shutter->publish_status();
   }
-  if (from_wall_switch) queue_.push_front({s, d, true, false});
-  else                  queue_.push_back({s, d, false, false});
+  if (from_wall_switch) queue_.push_front({s, d, true});
+  else                  queue_.push_back({s, d, false});
 
   // Visual feedback: a shutter sitting in the queue (not yet the active one)
   // immediately shows the opening/closing icon in HA, so a batch command makes
@@ -255,25 +269,43 @@ void ShutterHub::enqueue(Shutter *s, Dir d, bool from_wall_switch) {
 void ShutterHub::stop_active() {
   if (active_ == nullptr) return;
   if (state_ == HubState::MOVING) {
+    // Snapshot the position at the moment of the stop. Use the SAME
+    // interpolation as refresh_active_position_(): position =
+    // start + (target - start) * frac, where frac is the fraction of THIS
+    // move completed. Do NOT add/subtract frac to the running position --
+    // refresh_active_position_() has already advanced active_->position
+    // toward the target, so re-applying frac double-counts the travel and
+    // (e.g. closing from fully open, stopped halfway) snaps it to 0/closed.
     uint32_t elapsed = millis() - state_start_ms_;
     if (elapsed > active_duration_ms_) elapsed = active_duration_ms_;
     float frac = active_duration_ms_ == 0 ? 1.0f
                 : (float) elapsed / (float) active_duration_ms_;
-    if (active_dir_ == Dir::UP) {
-      active_->position = std::min(1.0f, active_->position + frac);
-    } else if (active_dir_ == Dir::DOWN) {
-      active_->position = std::max(0.0f, active_->position - frac);
-    }
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+    float target = (active_dir_ == Dir::UP) ? 1.0f : 0.0f;
+    float new_pos = active_start_pos_ + (target - active_start_pos_) * frac;
+    if (new_pos < 0.0f) new_pos = 0.0f;
+    if (new_pos > 1.0f) new_pos = 1.0f;
+    active_->position = new_pos;
+    active_->position_known = true;
   }
-  active_->current_operation = cover::COVER_OPERATION_IDLE;
-  active_->set_queued(false, Dir::NONE);
-  active_->de_energize();
-  active_->publish_state_from_position();
-  active_->save_position();
-  Shutter *stopped = active_;
+  this->finalize_active_(active_);
+}
+
+// Shared tail of stop_active() and complete_active_(): runs AFTER the final
+// position has been set on the finishing shutter. Marks it idle, releases the
+// relays, publishes/saves, clears the active slot, and arms the quiet
+// inter-request window (COOLDOWN) unless the queue is empty. Behavior and
+// timing are identical to the inlined versions it replaced.
+void ShutterHub::finalize_active_(Shutter *finished) {
+  if (finished == nullptr) return;
+  finished->current_operation = cover::COVER_OPERATION_IDLE;
+  finished->set_queued(false, Dir::NONE);
+  finished->de_energize();
+  finished->publish_state_from_position();
+  finished->save_position();
   active_ = nullptr;
   active_dir_ = Dir::NONE;
-  active_was_resume_ = false;
 
   // If there's still work queued, give the bus a quiet window before
   // starting the next one. If the queue is empty, go straight to IDLE
@@ -281,7 +313,7 @@ void ShutterHub::stop_active() {
   state_start_ms_ = millis();
   state_ = queue_.empty() ? HubState::IDLE : HubState::COOLDOWN;
 
-  this->update_group_states_for(stopped);
+  this->update_group_states_for(finished);
 }
 
 void ShutterHub::cancel_shutter(Shutter *s) {
@@ -315,21 +347,7 @@ void ShutterHub::complete_active_() {
   if (active_dir_ == Dir::UP) active_->position = 1.0f;
   else                        active_->position = 0.0f;
   active_->position_known = true;
-  active_->current_operation = cover::COVER_OPERATION_IDLE;
-  active_->set_queued(false, Dir::NONE);
-  active_->de_energize();
-  active_->publish_state_from_position();
-  active_->save_position();
-  Shutter *finished = active_;
-  active_ = nullptr;
-  active_dir_ = Dir::NONE;
-  active_was_resume_ = false;
-
-  // Same COOLDOWN logic as stop_active().
-  state_start_ms_ = millis();
-  state_ = queue_.empty() ? HubState::IDLE : HubState::COOLDOWN;
-
-  this->update_group_states_for(finished);
+  this->finalize_active_(active_);
 }
 
 void ShutterHub::update_group_states() {

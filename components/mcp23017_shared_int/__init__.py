@@ -49,7 +49,7 @@ from esphome.const import (
     CONF_NAME,
 )
 
-CODEOWNERS = ["@local"]
+CODEOWNERS = ["@automatorz"]
 DEPENDENCIES = ["i2c"]
 AUTO_LOAD = ["binary_sensor", "switch"]
 MULTI_CONF = False
@@ -84,6 +84,12 @@ CONF_LOCATIONS = "locations"
 
 DIR_INPUT = "input"
 DIR_OUTPUT = "output"
+
+# Default Home Assistant name prefixes for auto-generated bank entities.
+# The "ZZ" prefix on outputs makes them sort last alphabetically in Home
+# Assistant, keeping inputs grouped ahead of outputs in entity lists.
+DEFAULT_INPUT_NAME_PREFIX = "HAS"
+DEFAULT_OUTPUT_NAME_PREFIX = "ZZHAS"
 
 # ---------------------------------------------------------------------------
 # Low-level chips schema (unchanged, still supported)
@@ -245,12 +251,12 @@ async def _gen_bank(coord, chip, board_id, chip_id, chip_index, bank_conf, is_ba
         pin = pin_base + i
         location = _location_for(bank_conf, chip_index, pin, is_bank_a)
         if direction == DIR_INPUT:
-            prefix = name_prefix if name_prefix is not None else "HAS"
+            prefix = name_prefix if name_prefix is not None else DEFAULT_INPUT_NAME_PREFIX
             await _gen_input_pin(
                 coord, chip, board_id, chip_id, pin, prefix, location, inverted
             )
         else:
-            prefix = name_prefix if name_prefix is not None else "ZZHAS"
+            prefix = name_prefix if name_prefix is not None else DEFAULT_OUTPUT_NAME_PREFIX
             await _gen_output_pin(
                 chip, board_id, chip_id, pin, prefix, location, inverted
             )
