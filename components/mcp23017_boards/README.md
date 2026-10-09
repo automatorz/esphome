@@ -59,13 +59,21 @@ mcp23017_boards:
       bank_a: { direction: input }
       bank_b:
         direction: output
-        pins:
-          8:
-            role: light
-            id: workshop_light
-            name: "Workshop Light"
-            on_buttons: [has_boardA1_chip01_pin00]
-            off_buttons: [has_boardA1_chip01_pin01]
+        pins:                     # nested: chip -> pin -> override
+          "01":                   # chip 1
+            8:
+              role: light
+              id: workshop_light
+              name: "Workshop Light"
+              on_buttons: [has_boardA1_chip01_pin00]
+              off_buttons: [has_boardA1_chip01_pin01]
+            9:
+              role: switch        # same as omitting it (switch is the default)
+          "02":                   # chip 2
+            8:
+              role: light
+              id: hallway_light
+              name: "Hallway Light"
 ```
 
 ### Board keys
@@ -92,9 +100,29 @@ mcp23017_boards:
 
 ### Per-pin keys (output banks)
 
-The `pins:` map is keyed by the physical MCP pin number (0–15). Any pin not
-listed defaults to the `switch` role. So you only need an entry for pins that
-are lights or that need non-default settings.
+The `pins:` map is **nested by chip, then by physical pin**:
+
+```yaml
+pins:
+  "01":          # chip 1
+    8: { role: light, id: workshop_light, name: "Workshop Light" }
+    9: { role: switch }
+  "02":          # chip 2
+    8: { role: switch }
+```
+
+- **Chip key** (outer): a chip identifier. Accepted forms are the strings
+  `"01"` / `"02"` and the bare ints `1` / `2` (and `"1"` / `"2"`); all normalize
+  to the canonical `"01"` / `"02"`. Declaring the same chip twice under
+  different key forms (e.g. `"01"` and `1`) is an error.
+- **Pin key** (inner): the physical MCP pin. The valid range depends on the
+  bank: `0`–`7` for `bank_a`, `8`–`15` for `bank_b`. An out-of-range pin is
+  rejected with an error naming the pin, chip, and bank.
+
+An override only applies to the chip it is nested under — a `light` on chip
+`"01"` pin 8 does **not** also create one on chip `"02"` pin 8. Any pin not
+listed under its chip defaults to the `switch` role, so you only need an entry
+for pins that are lights or that need non-default settings.
 
 | Key            | Role     | Default                                   | Description                                     |
 | -------------- | -------- | ----------------------------------------- | ----------------------------------------------- |
@@ -123,6 +151,24 @@ For a `light` pin, each id in `on_buttons` gets an additive
 generated input ids (`has_board<id>_chip<CC>_pin<PP>`). They are **additive** —
 multiple lights can share a button, and you can attach further automations
 elsewhere.
+
+## Validation guarantees
+
+The component validates the whole `boards:` config before any code is
+generated, so a mistake fails fast with a clear message instead of producing a
+broken ESPHome config:
+
+1. **No duplicate output pin.** Each `(chip, pin)` output override may be
+   declared only once. Keys that collide after normalization (e.g. the chip
+   keys `"01"` and `1`) are rejected.
+2. **No duplicate light id or name.** Every `light` pin's `id` and `name` must
+   be unique across the entire config — across all boards, banks and chips. A
+   collision names the offending id/name and both locations.
+3. **Button references must exist.** Every id in a light's `on_buttons` /
+   `off_buttons` must be an input binary_sensor this config actually generates
+   (`has_board<BID>_chip<CC>_pin<PP>`, for a pin in an `input` bank). Buttons
+   may reference inputs on either chip of any board; an unknown id is rejected
+   with a message naming the id and the light.
 
 ## Overriding generated entities with `!extend`
 

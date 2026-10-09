@@ -30,13 +30,14 @@ Board config shape::
           bank_a: { direction: input }         # bottom row -> binary_sensors
           bank_b:                              # top row -> outputs
             direction: output
-            pins:
-              8:
-                role: light
-                id: workshop_light
-                name: "Workshop Light"
-                on_buttons: [has_boardA1_chip01_pin00]
-                off_buttons: [has_boardA1_chip01_pin01]
+            pins:                              # nested: chip -> pin -> override
+              "01":                            # chip 1 ("01"/"02" or 1/2)
+                8:
+                  role: light
+                  id: workshop_light
+                  name: "Workshop Light"
+                  on_buttons: [has_boardA1_chip01_pin00]
+                  off_buttons: [has_boardA1_chip01_pin01]
 
 A board expands into (for board_id "A1"):
   * chips ``mcp23017_bA1_c01`` and ``..._c02``
@@ -143,6 +144,31 @@ def _validate_pin(value):
     return value
 
 
+# Canonical two-digit chip identifiers ("01" = chip 1, "02" = chip 2).
+_CHIP_IDS = ("01", "02")
+
+
+def _normalize_chip_key(value):
+    """Normalize a user-supplied chip key to the canonical "01"/"02" form.
+
+    Accepts the strings "01"/"02" and the ints 1/2 (and their bare string
+    forms "1"/"2"). Raises cv.Invalid for anything else."""
+    if isinstance(value, bool):
+        # bool is an int subclass; reject it explicitly to avoid True -> "01".
+        raise cv.Invalid(f"Invalid chip key {value!r}; expected '01'/'02' or 1/2.")
+    if isinstance(value, int):
+        text = f"{value:02d}"
+    else:
+        text = str(value).strip()
+        if text in ("1", "2"):
+            text = f"0{text}"
+    if text not in _CHIP_IDS:
+        raise cv.Invalid(
+            f"Invalid chip key {value!r}; expected one of '01'/'02' (or 1/2)."
+        )
+    return text
+
+
 # ---------------------------------------------------------------------------
 # High-level board / bank schema
 # ---------------------------------------------------------------------------
@@ -162,19 +188,63 @@ def _bank_schema(default_location_prefix):
             cv.Optional(CONF_LOCATIONS): cv.All(
                 cv.ensure_list(cv.string), cv.Length(min=16, max=16)
             ),
-            # Per-pin role / override map, keyed by physical MCP pin 0..15.
-            # Only meaningful for output banks; rejected on inputs below.
+            # Per-pin role / override map, nested by CHIP then physical pin.
+            # The chip key is a chip identifier ("01"/"02", or 1/2 which is
+            # normalized to "01"/"02" in _validate_bank); the inner key is the
+            # physical MCP pin (0..7 for bank_a, 8..15 for bank_b). Only
+            # meaningful for output banks; rejected on inputs below.
             cv.Optional(CONF_PINS): cv.Schema(
-                {cv.int_range(min=0, max=15): _validate_pin}
+                {cv.string: cv.Schema({cv.int_: _validate_pin})}
             ),
         }
     )
 
 
-def _validate_bank(value):
-    if value[CONF_DIRECTION] == DIR_INPUT and value.get(CONF_PINS):
-        raise cv.Invalid("'pins' overrides are only valid for output banks.")
-    return value
+def _make_validate_bank(is_bank_a):
+    """Build the bank-level validator, bound to which physical bank this is so
+    the valid pin range is fixed by the bank (not the configurable prefix)."""
+    pin_base, pin_bound = (0, 7) if is_bank_a else (8, 15)
+    bank_label = "bank_a (Bottom)" if is_bank_a else "bank_b (Top)"
+
+    def _validate_bank(value):
+        if value[CONF_DIRECTION] == DIR_INPUT and value.get(CONF_PINS):
+            raise cv.Invalid(
+                "'pins' overrides are only valid for output banks."
+            )
+
+        pins_conf = value.get(CONF_PINS)
+        if pins_conf:
+            # Re-key the nested pins map by canonical chip id, validate pin
+            # ranges, and reject any (chip, pin) collision that only shows up
+            # after normalization (e.g. "01"/1 as chip keys, or 8/"8" as pins).
+            normalized = {}
+            for chip_key, chip_pins in pins_conf.items():
+                chip_id = _normalize_chip_key(chip_key)
+                if chip_id in normalized:
+                    raise cv.Invalid(
+                        f"Chip {chip_id} is declared more than once in "
+                        f"{bank_label} 'pins' (key {chip_key!r} collides with "
+                        f"another chip key after normalization)."
+                    )
+                seen_pins = {}
+                for pin, pin_conf in chip_pins.items():
+                    if not pin_base <= pin <= pin_bound:
+                        raise cv.Invalid(
+                            f"Pin {pin} is out of range for {bank_label} on "
+                            f"chip {chip_id}; valid pins are "
+                            f"{pin_base}..{pin_bound}."
+                        )
+                    if pin in seen_pins:
+                        raise cv.Invalid(
+                            f"Pin {pin} on chip {chip_id} in {bank_label} is "
+                            f"declared more than once."
+                        )
+                    seen_pins[pin] = pin_conf
+                normalized[chip_id] = seen_pins
+            value[CONF_PINS] = normalized
+        return value
+
+    return _validate_bank
 
 
 BOARD_SCHEMA = cv.Schema(
@@ -183,18 +253,111 @@ BOARD_SCHEMA = cv.Schema(
         cv.Required(CONF_I2C_ID): cv.use_id(i2c.I2CBus),
         cv.Optional(CONF_CHIP1_ADDRESS, default=0x20): cv.i2c_address,
         cv.Optional(CONF_CHIP2_ADDRESS, default=0x21): cv.i2c_address,
-        cv.Required(CONF_BANK_A): cv.All(_bank_schema("Bottom"), _validate_bank),
-        cv.Required(CONF_BANK_B): cv.All(_bank_schema("Top"), _validate_bank),
+        cv.Required(CONF_BANK_A): cv.All(
+            _bank_schema("Bottom"), _make_validate_bank(True)
+        ),
+        cv.Required(CONF_BANK_B): cv.All(
+            _bank_schema("Top"), _make_validate_bank(False)
+        ),
     }
 )
 
 
-CONFIG_SCHEMA = cv.Schema(
-    {
-        cv.Required(CONF_BOARDS): cv.All(
-            cv.ensure_list(BOARD_SCHEMA), cv.Length(min=1, max=16)
-        ),
-    }
+# ---------------------------------------------------------------------------
+# Whole-config cross validation
+# ---------------------------------------------------------------------------
+def _iter_output_light_pins(boards):
+    """Yield (board_id, chip_id, pin, pin_conf) for every light-role output pin
+    across the whole config. Runs after per-pin/_bank defaults are applied, so
+    pin_conf has its CONF_ROLE/CONF_ID/CONF_NAME populated."""
+    for board_conf in boards:
+        board_id = board_conf[CONF_BOARD_ID]
+        for bank_conf in (board_conf[CONF_BANK_A], board_conf[CONF_BANK_B]):
+            if bank_conf[CONF_DIRECTION] != DIR_OUTPUT:
+                continue
+            for chip_id, chip_pins in bank_conf.get(CONF_PINS, {}).items():
+                for pin, pin_conf in chip_pins.items():
+                    if pin_conf[CONF_ROLE] == ROLE_LIGHT:
+                        yield board_id, chip_id, pin, pin_conf
+
+
+def _generated_input_ids(boards):
+    """Compute the full set of input binary_sensor ids this config generates:
+    for every input-direction bank, both chips, every pin in the bank range,
+    id ``has_board<BID>_chip<CC>_pin<PP>`` (PP zero-padded), matching
+    _gen_input_pin."""
+    ids = set()
+    for board_conf in boards:
+        board_id = board_conf[CONF_BOARD_ID]
+        for bank_conf, is_bank_a in (
+            (board_conf[CONF_BANK_A], True),
+            (board_conf[CONF_BANK_B], False),
+        ):
+            if bank_conf[CONF_DIRECTION] != DIR_INPUT:
+                continue
+            pin_base = 0 if is_bank_a else 8
+            for chip_id in _CHIP_IDS:
+                for i in range(8):
+                    pin = pin_base + i
+                    ids.add(f"has_board{board_id}_chip{chip_id}_pin{pin:02d}")
+    return ids
+
+
+def _validate_config(config):
+    """Whole-config guardrails, applied after all defaults are set:
+
+    1. Duplicate light id / light name across every board/bank/chip.
+    2. Every on_buttons/off_buttons id must be an input binary_sensor this
+       config actually generates (on either chip of any board)."""
+    boards = config[CONF_BOARDS]
+
+    seen_ids = {}
+    seen_names = {}
+    for board_id, chip_id, pin, pin_conf in _iter_output_light_pins(boards):
+        where = f"board {board_id} chip {chip_id} pin {pin}"
+        light_id = pin_conf[CONF_ID]
+        if light_id in seen_ids:
+            raise cv.Invalid(
+                f"Duplicate light id '{light_id}': used at {seen_ids[light_id]} "
+                f"and {where}. Light ids must be unique across the whole config."
+            )
+        seen_ids[light_id] = where
+
+        light_name = pin_conf[CONF_NAME]
+        if light_name in seen_names:
+            raise cv.Invalid(
+                f"Duplicate light name '{light_name}': used at "
+                f"{seen_names[light_name]} and {where}. Light names must be "
+                f"unique across the whole config."
+            )
+        seen_names[light_name] = where
+
+    valid_input_ids = _generated_input_ids(boards)
+    for board_id, chip_id, pin, pin_conf in _iter_output_light_pins(boards):
+        light_id = pin_conf[CONF_ID]
+        for key in (CONF_ON_BUTTONS, CONF_OFF_BUTTONS):
+            for btn in pin_conf.get(key, []):
+                if btn not in valid_input_ids:
+                    raise cv.Invalid(
+                        f"Light '{light_id}' (board {board_id} chip {chip_id} "
+                        f"pin {pin}) lists '{btn}' in '{key}', but no input "
+                        f"binary_sensor with that id is generated by this "
+                        f"config. '{key}' must reference generated input ids "
+                        f"(has_board<BID>_chip<CC>_pin<PP>)."
+                    )
+
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.Required(CONF_BOARDS): cv.All(
+                cv.ensure_list(BOARD_SCHEMA), cv.Length(min=1, max=16)
+            ),
+        }
+    ),
+    _validate_config,
 )
 
 
@@ -378,14 +541,16 @@ def _collect_button_actions(bank_conf):
     gathered from every light pin's on_buttons / off_buttons in this output bank.
     Multiple lights referencing the same button accumulate (additive)."""
     actions = {}
-    for pin_conf in bank_conf.get(CONF_PINS, {}).values():
-        if pin_conf[CONF_ROLE] != ROLE_LIGHT:
-            continue
-        light_id = pin_conf[CONF_ID]
-        for btn in pin_conf.get(CONF_ON_BUTTONS, []):
-            actions.setdefault(btn, []).append({"light.turn_on": light_id})
-        for btn in pin_conf.get(CONF_OFF_BUTTONS, []):
-            actions.setdefault(btn, []).append({"light.turn_off": light_id})
+    # The pins map is nested chip -> pin -> pin_conf; iterate the inner dicts.
+    for chip_pins in bank_conf.get(CONF_PINS, {}).values():
+        for pin_conf in chip_pins.values():
+            if pin_conf[CONF_ROLE] != ROLE_LIGHT:
+                continue
+            light_id = pin_conf[CONF_ID]
+            for btn in pin_conf.get(CONF_ON_BUTTONS, []):
+                actions.setdefault(btn, []).append({"light.turn_on": light_id})
+            for btn in pin_conf.get(CONF_OFF_BUTTONS, []):
+                actions.setdefault(btn, []).append({"light.turn_off": light_id})
     return actions
 
 
@@ -419,8 +584,12 @@ async def _gen_bank(
             prefix = (
                 name_prefix if name_prefix is not None else DEFAULT_OUTPUT_NAME_PREFIX
             )
-            # Pins without an explicit entry default to the switch role.
-            pin_conf = pins_conf.get(pin, {CONF_ROLE: ROLE_SWITCH})
+            # Look up the override nested under THIS chip, then this pin. A pin
+            # with no entry under its chip stays the default switch role, so an
+            # override only applies to the chip it is nested under.
+            pin_conf = pins_conf.get(chip_id, {}).get(
+                pin, {CONF_ROLE: ROLE_SWITCH}
+            )
             if pin_conf[CONF_ROLE] == ROLE_LIGHT:
                 await _gen_light_pin(
                     chip_id_name, board_id, chip_id, pin, pin_conf, bank_inverted
