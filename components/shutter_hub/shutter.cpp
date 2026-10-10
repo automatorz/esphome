@@ -51,9 +51,8 @@ void Shutter::apply_loaded_position() {
 }
 
 void Shutter::dump_config() {
-  ESP_LOGCONFIG(TAG, "Shutter '%s' travel=%ums open_at_sunrise=%d close_at_sunset=%d window=%d index=%u",
+  ESP_LOGCONFIG(TAG, "Shutter '%s' travel=%ums index=%u",
                 this->get_name().c_str(), (unsigned) travel_ms_,
-                open_at_sunrise_, close_at_sunset_, has_window_,
                 (unsigned) index_);
 }
 
@@ -67,13 +66,6 @@ cover::CoverTraits Shutter::get_traits() {
 }
 
 void Shutter::apply_manual_command(Dir d) {
-  if (d == Dir::UP) {
-    sunrise_cancelled_today     = true;
-    sun_through_cancelled_today = true;
-    closed_by_sun_through       = false;
-  } else if (d == Dir::DOWN) {
-    sunset_cancelled_today = true;
-  }
   if (hub_ != nullptr) hub_->enqueue(this, d, false);
 }
 
@@ -169,10 +161,6 @@ void Shutter::publish_position_sensor() {
   position_sensor_->publish_state((float) std::lroundf(p * 100.0f));
 }
 
-void Shutter::publish_sun_through(bool on) {
-  if (sun_through_sensor_ != nullptr) sun_through_sensor_->publish_state(on);
-}
-
 void Shutter::save_position() {
   if (!restore_) return;
   if (!std::isfinite(this->position)) {
@@ -185,34 +173,6 @@ void Shutter::save_position() {
 
 void Shutter::restore_position() {
   this->apply_loaded_position();
-}
-
-bool Shutter::compute_sun_through_raw(float az, float el) const {
-  // NaN guard intentionally omitted: the sole caller,
-  // ShutterHub::sun_through_active(), already rejects NaN az/el before
-  // calling here, so a guard here would be provably redundant.
-  if (!has_window_) return false;
-  if (el <= 0.0f) return false;
-  const float W = window_.w, D = window_.d, H = window_.h;
-  const float HD_ratio = H / D;
-  const float max_horiz_angle_deg = std::atanf(W / D) * 180.0f / (float) M_PI;
-  if (window_.o == WindowOrientation::EAST) {
-    if (az <= 0.0f || az >= 180.0f) return false;
-    if (std::fabs(az - 90.0f) >= max_horiz_angle_deg) return false;
-    float az_rad = az * (float) M_PI / 180.0f;
-    float tan_el = std::tanf(el * (float) M_PI / 180.0f);
-    float limit  = HD_ratio * std::sinf(az_rad);
-    if (tan_el >= limit) return false;
-    return true;
-  } else {
-    if (az <= 180.0f || az >= 360.0f) return false;
-    if (std::fabs(az - 270.0f) >= max_horiz_angle_deg) return false;
-    float az_rad = az * (float) M_PI / 180.0f;
-    float tan_el = std::tanf(el * (float) M_PI / 180.0f);
-    float limit  = HD_ratio * (-std::sinf(az_rad));
-    if (tan_el >= limit) return false;
-    return true;
-  }
 }
 
 }}  // namespace shutter_hub

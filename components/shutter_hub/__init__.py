@@ -66,15 +66,7 @@ SHUTTER_SCHEMA = cover.cover_schema(Shutter).extend({
     cv.Required(CONF_UP_RELAY): cv.use_id(switch_.Switch),
     cv.Required(CONF_DOWN_RELAY): cv.use_id(switch_.Switch),
     cv.Required(CONF_TRAVEL_TIME): cv.positive_time_period_milliseconds,
-    cv.Optional(CONF_OPEN_AT_SUNRISE, default=True): cv.boolean,
-    cv.Optional(CONF_CLOSE_AT_SUNSET, default=True): cv.boolean,
-    cv.Optional(CONF_SUNRISE_OFFSET, default="0min"): cv.positive_time_period_minutes,
-    cv.Optional(CONF_SUNSET_OFFSET,  default="0min"): cv.positive_time_period_minutes,
-    cv.Optional(CONF_SUPPRESS_SUNRISE, default=True): cv.boolean,
-    cv.Optional(CONF_WINDOW): WINDOW_SCHEMA,
-    cv.Optional(CONF_CLOSE_ON_SUN, default=True): cv.boolean,
     cv.Optional(CONF_RESTORE, default=True): cv.boolean,
-    cv.Optional(CONF_SUN_THROUGH_SENSOR): cv.use_id(binary_sensor.BinarySensor),
     # Telemetry entities exposed to Home Assistant. Both default on; set to
     # false per shutter to opt out of that entity.
     cv.Optional(CONF_STATUS_SENSOR, default=True): cv.boolean,
@@ -91,6 +83,16 @@ GROUP_SCHEMA = cover.cover_schema(ShutterGroup).extend({
     cv.Required(CONF_SHUTTERS): cv.ensure_list(cv.use_id(Shutter)),
     cv.Optional(CONF_CLICK_WIN, default="400ms"): cv.positive_time_period_milliseconds,
     cv.Optional(CONF_DEBOUNCE, default="20ms"): cv.positive_time_period_milliseconds,
+    # Sun-based automation now lives on the group (moved from the shutter).
+    # All actions default off, so an unconfigured group does nothing.
+    cv.Optional(CONF_OPEN_AT_SUNRISE, default=False): cv.boolean,
+    cv.Optional(CONF_CLOSE_AT_SUNSET, default=False): cv.boolean,
+    cv.Optional(CONF_CLOSE_ON_SUN, default=False): cv.boolean,
+    cv.Optional(CONF_SUNRISE_OFFSET, default="0min"): cv.positive_time_period_minutes,
+    cv.Optional(CONF_SUNSET_OFFSET,  default="0min"): cv.positive_time_period_minutes,
+    cv.Optional(CONF_SUPPRESS_SUNRISE, default=True): cv.boolean,
+    cv.Optional(CONF_WINDOW): WINDOW_SCHEMA,
+    cv.Optional(CONF_SUN_THROUGH_SENSOR): cv.use_id(binary_sensor.BinarySensor),
 })
 
 CONFIG_SCHEMA = cv.Schema({
@@ -140,20 +142,7 @@ async def to_code(config):
         cg.add(sv.set_up_relay(await cg.get_variable(s[CONF_UP_RELAY])))
         cg.add(sv.set_down_relay(await cg.get_variable(s[CONF_DOWN_RELAY])))
         cg.add(sv.set_travel_time(s[CONF_TRAVEL_TIME]))
-        cg.add(sv.set_open_at_sunrise(s[CONF_OPEN_AT_SUNRISE]))
-        cg.add(sv.set_close_at_sunset(s[CONF_CLOSE_AT_SUNSET]))
-        cg.add(sv.set_sunrise_offset(s[CONF_SUNRISE_OFFSET]))
-        cg.add(sv.set_sunset_offset(s[CONF_SUNSET_OFFSET]))
-        cg.add(sv.set_suppress_sunrise_if_sun_through(s[CONF_SUPPRESS_SUNRISE]))
-        cg.add(sv.set_close_on_sun_through(s[CONF_CLOSE_ON_SUN]))
         cg.add(sv.set_restore(s[CONF_RESTORE]))
-        if CONF_WINDOW in s:
-            w = s[CONF_WINDOW]
-            cg.add(sv.set_window(w[CONF_W], w[CONF_D], w[CONF_H],
-                                 w[CONF_ORIENT], w[CONF_MARGIN]))
-        if CONF_SUN_THROUGH_SENSOR in s:
-            cg.add(sv.set_sun_through_sensor(
-                await cg.get_variable(s[CONF_SUN_THROUGH_SENSOR])))
 
         base_name = s.get(CONF_NAME) or str(s[CONF_ID])
         if s[CONF_STATUS_SENSOR]:
@@ -190,6 +179,19 @@ async def to_code(config):
             cg.add(gv.set_wall_down(await cg.get_variable(g[CONF_WALL_DOWN])))
         cg.add(gv.set_click_window(g[CONF_CLICK_WIN]))
         cg.add(gv.set_debounce(g[CONF_DEBOUNCE]))
+        cg.add(gv.set_open_at_sunrise(g[CONF_OPEN_AT_SUNRISE]))
+        cg.add(gv.set_close_at_sunset(g[CONF_CLOSE_AT_SUNSET]))
+        cg.add(gv.set_sunrise_offset(g[CONF_SUNRISE_OFFSET]))
+        cg.add(gv.set_sunset_offset(g[CONF_SUNSET_OFFSET]))
+        cg.add(gv.set_suppress_sunrise_if_sun_through(g[CONF_SUPPRESS_SUNRISE]))
+        cg.add(gv.set_close_on_sun_through(g[CONF_CLOSE_ON_SUN]))
+        if CONF_WINDOW in g:
+            w = g[CONF_WINDOW]
+            cg.add(gv.set_window(w[CONF_W], w[CONF_D], w[CONF_H],
+                                 w[CONF_ORIENT], w[CONF_MARGIN]))
+        if CONF_SUN_THROUGH_SENSOR in g:
+            cg.add(gv.set_sun_through_sensor(
+                await cg.get_variable(g[CONF_SUN_THROUGH_SENSOR])))
         for sh in g[CONF_SHUTTERS]:
             cg.add(gv.add_shutter(await cg.get_variable(sh)))
         cg.add(var.add_group(gv))

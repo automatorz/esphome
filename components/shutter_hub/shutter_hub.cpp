@@ -127,10 +127,12 @@ void ShutterHub::loop() {
       boot_sunset_check_done_ = true;
       if (el <= 0.0f) {
         ESP_LOGD(TAG, "Boot: sun below horizon (el=%.1f), enforcing sunset close", el);
-        for (auto *s : shutters_) {
-          if (!s->close_at_sunset() || s->sunset_cancelled_today) continue;
-          if (s->position_known && s->position <= 0.01f) continue;
-          this->enqueue(s, Dir::DOWN, false);
+        for (auto *g : groups_) {
+          if (!g->close_at_sunset() || g->sunset_cancelled_today) continue;
+          for (auto *s : g->shutters()) {
+            if (s->position_known && s->position <= 0.01f) continue;
+            this->enqueue(s, Dir::DOWN, false);
+          }
         }
       }
     }
@@ -220,15 +222,10 @@ void ShutterHub::refresh_active_position_() {
 }
 
 void ShutterHub::enqueue(Shutter *s, Dir d, bool from_wall_switch) {
-  if (from_wall_switch) {
-    if (d == Dir::UP) {
-      s->sunrise_cancelled_today     = true;
-      s->sun_through_cancelled_today = true;
-      s->closed_by_sun_through       = false;
-    } else {
-      s->sunset_cancelled_today = true;
-    }
-  }
+  // NOTE: enqueue no longer touches any daily-cancel flags. Those flags live
+  // on ShutterGroup and are set by the group at the manual-command origin
+  // (ShutterGroup::fire_click_ / control). from_wall_switch here only controls
+  // queue preemption, not cancel semantics.
   queue_.erase(
       std::remove_if(queue_.begin(), queue_.end(),
                      [s](const Request &r) { return r.shutter == s; }),
@@ -373,64 +370,79 @@ bool ShutterHub::heating_needed_on() const {
   return heat_ != nullptr && heat_->state;
 }
 
-bool ShutterHub::sun_through_active(Shutter *s) {
-  if (!s->has_window()) return false;
+bool ShutterHub::sun_through_active(ShutterGroup *g) {
+  if (!g->has_window()) return false;
   float az = this->sun_azimuth();
   float el = this->sun_elevation();
   if (std::isnan(az) || std::isnan(el)) return false;
-  if (el < s->elevation_margin()) return false;
-  return s->compute_sun_through_raw(az, el);
+  if (el < g->elevation_margin()) return false;
+  return g->compute_sun_through_raw(az, el);
 }
 
 void ShutterHub::schedule_sunrise_open() {
-  for (auto *s : shutters_) {
-    if (!s->open_at_sunrise() || s->sunrise_cancelled_today) continue;
-    if (s->suppress_sunrise_if_sun_through() && this->sun_through_active(s)) continue;
-    if (s->position_known && s->position >= 0.99f) continue;
-    uint32_t off = s->sunrise_offset_ms();
-    if (off == 0) this->enqueue(s, Dir::UP, false);
-    else this->set_timeout(off, [this, s]() { this->enqueue(s, Dir::UP, false); });
+  for (auto *g : groups_) {
+    if (!g->open_at_sunrise() || g->sunrise_cancelled_today) continue;
+    if (g->suppress_sunrise_if_sun_through() && this->sun_through_active(g)) continue;
+    uint32_t off = g->sunrise_offset_ms();
+    for (auto *s : g->shutters()) {
+      // Option (b): skip any member already open; enqueue the rest one at a
+      // time through the existing hub queue.
+      if (s->position_known && s->position >= 0.99f) continue;
+      if (off == 0) this->enqueue(s, Dir::UP, false);
+      else this->set_timeout(off, [this, s]() { this->enqueue(s, Dir::UP, false); });
+    }
   }
 }
 
 void ShutterHub::schedule_sunset_close() {
-  for (auto *s : shutters_) {
-    if (!s->close_at_sunset() || s->sunset_cancelled_today) continue;
-    if (s->position_known && s->position <= 0.01f) continue;
-    uint32_t off = s->sunset_offset_ms();
-    if (off == 0) this->enqueue(s, Dir::DOWN, false);
-    else this->set_timeout(off, [this, s]() { this->enqueue(s, Dir::DOWN, false); });
+  for (auto *g : groups_) {
+    if (!g->close_at_sunset() || g->sunset_cancelled_today) continue;
+    uint32_t off = g->sunset_offset_ms();
+    for (auto *s : g->shutters()) {
+      // Option (b): skip any member already closed.
+      if (s->position_known && s->position <= 0.01f) continue;
+      if (off == 0) this->enqueue(s, Dir::DOWN, false);
+      else this->set_timeout(off, [this, s]() { this->enqueue(s, Dir::DOWN, false); });
+    }
   }
 }
 
 void ShutterHub::on_sun_update() {
-  for (auto *s : shutters_) {
-    if (!s->has_window()) continue;
-    bool active = this->sun_through_active(s);
-    s->publish_sun_through(active);
-    if (!s->close_on_sun_through()) continue;
-    if (s->sun_through_cancelled_today) continue;
+  for (auto *g : groups_) {
+    if (!g->has_window()) continue;
+    bool active = this->sun_through_active(g);
+    g->publish_sun_through(active);
+    if (!g->close_on_sun_through()) continue;
+    if (g->sun_through_cancelled_today) continue;
     if (this->heating_needed_on()) continue;
-    if (active && !s->closed_by_sun_through) {
-      this->enqueue(s, Dir::DOWN, false);
-      s->closed_by_sun_through = true;
-    } else if (!active && s->closed_by_sun_through) {
-      float el = this->sun_elevation();
-      if (!s->close_at_sunset() && !std::isnan(el) &&
-          el > s->elevation_margin()) {
-        this->enqueue(s, Dir::UP, false);
+    if (active && !g->closed_by_sun_through) {
+      for (auto *s : g->shutters()) {
+        // Option (b): skip members already closed.
+        if (s->position_known && s->position <= 0.01f) continue;
+        this->enqueue(s, Dir::DOWN, false);
       }
-      s->closed_by_sun_through = false;
+      g->closed_by_sun_through = true;
+    } else if (!active && g->closed_by_sun_through) {
+      float el = this->sun_elevation();
+      if (!g->close_at_sunset() && !std::isnan(el) &&
+          el > g->elevation_margin()) {
+        for (auto *s : g->shutters()) {
+          // Option (b): skip members already open.
+          if (s->position_known && s->position >= 0.99f) continue;
+          this->enqueue(s, Dir::UP, false);
+        }
+      }
+      g->closed_by_sun_through = false;
     }
   }
 }
 
 void ShutterHub::reset_daily_flags() {
-  for (auto *s : shutters_) {
-    s->sunrise_cancelled_today     = false;
-    s->sunset_cancelled_today      = false;
-    s->sun_through_cancelled_today = false;
-    s->closed_by_sun_through       = false;
+  for (auto *g : groups_) {
+    g->sunrise_cancelled_today     = false;
+    g->sunset_cancelled_today      = false;
+    g->sun_through_cancelled_today = false;
+    g->closed_by_sun_through       = false;
   }
   ESP_LOGD(TAG, "Daily flags reset");
 }

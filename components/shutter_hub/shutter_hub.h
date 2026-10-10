@@ -52,7 +52,7 @@ class ShutterHub : public Component {
   void schedule_sunrise_open();
   void schedule_sunset_close();
   void on_sun_update();
-  bool sun_through_active(Shutter *s);
+  bool sun_through_active(ShutterGroup *g);
   bool heating_needed_on() const;
   float sun_azimuth() const;
   float sun_elevation() const;
