@@ -1,6 +1,6 @@
 /**
  * shutter-group-card
- * Version: v0.4.2 (2026-10-09)
+ * Version: v0.6.2 (2026-10-10)
  *
  * A Lovelace custom card for the `shutter_hub` ESPHome component.
  *
@@ -29,12 +29,49 @@
  *     - name: Bath
  *       status: sensor.bath_shutter_status
  *       position: sensor.bath_shutter_position
+ *   # optional: a sun icon (grey = not through, yellow = shining through) shown
+ *   # between the shutter icons and the control buttons. Omit for no sun icon.
+ *   sun_through_entity: binary_sensor.bedroom_c_sun_through
  *
  * No build step. Drop this file in HA's config/www/ and register it as a
  * dashboard resource (JavaScript Module), then use type: custom:shutter-group-card.
  */
 
-const CARD_VERSION = "v0.4.2 (2026-10-09)";
+const CARD_VERSION = "v0.6.2 (2026-10-10)";
+
+// ---------------------------------------------------------------------------
+// Appearance configuration. Edit these constants to tune the card's look for
+// ALL instances of the card (this is file-level config, not per-card YAML).
+// Sizes are in pixels unless noted. Colors accept any CSS color, including HA
+// theme variables like "var(--primary-color)".
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  // Shutter (member) icons. A single size (the icon WIDTH in px); the height
+  // is derived automatically from the icon's native 48:58 aspect ratio so the
+  // shutter always keeps its correct shape.
+  shutterIconSize: 24,           // px (width; height auto-scales)
+  memberGap: 18,                 // px — horizontal gap between shutter icons
+  showLabels: true,              // show the status text under each shutter
+
+  // Sun-through indicator.
+  sunIconSize: 24,               // px
+
+  // Control buttons (the tile-style open/stop/close group).
+  buttonSize: 32,                // px — button height / touch target
+  buttonGroupWidth: 180,         // px — total width of the 3-button group
+  buttonIconSize: 24,            // px — the glyph inside each button
+
+  // Typography.
+  titleFontSize: "1.1rem",
+  labelFontSize: "0.8rem",
+
+  // Colors. Default to HA theme variables so the card matches your theme;
+  // override with explicit colors (e.g. "#2196f3") if you prefer.
+  shutterColor: "var(--primary-color)",            // slats, headrail, frame
+  sunOffColor: "var(--disabled-text-color, #9e9e9e)",   // sun not shining through
+  sunOnColor: "var(--state-sun-above-horizon-color, #ffb300)", // sun shining through
+  buttonIconColor: "var(--primary-text-color)",
+};
 
 const STATUS = {
   OPEN: "open",
@@ -252,6 +289,17 @@ class ShutterGroupCard extends HTMLElement {
       return { cell, icon, label };
     });
 
+    // Optional sun-through indicator, between the member icons and the
+    // control buttons. Only created if the card config supplies
+    // `sun_through_entity`. Grey when off/unknown, yellow when the sun is
+    // shining through (sensor state "on").
+    if (this._config.sun_through_entity) {
+      this._sunEl = document.createElement("div");
+      this._sunEl.className = "sg-sun";
+      this._sunEl.innerHTML = this._sunSvg();
+      body.appendChild(this._sunEl);
+    }
+
     // Buttons: replicate HA's tile "cover-open-close" feature exactly —
     // an <ha-control-button-group> (horizontal) of <ha-control-button>
     // elements with <ha-svg-icon> children. These are the rounded-rectangle
@@ -271,6 +319,25 @@ class ShutterGroupCard extends HTMLElement {
     group.appendChild(this._makeControlButton(MDI_UP, "Open", "open_cover"));
     group.appendChild(this._makeControlButton(MDI_STOP, "Stop", "stop_cover"));
     group.appendChild(this._makeControlButton(MDI_DOWN, "Close", "close_cover"));
+  }
+
+  // Sun-through indicator SVG (MDI weather-sunny). Color comes from CSS via
+  // the sg-sun-on class toggled in _update().
+  _sunSvg() {
+    const MDI_SUNNY =
+      "M12,7A5,5 0 0,1 17,12A5,5 0 0,1 12,17A5,5 0 0,1 7,12A5,5 0 0,1 12,7" +
+      "M12,9A3,3 0 0,0 9,12A3,3 0 0,0 12,15A3,3 0 0,0 15,12A3,3 0 0,0 12,9" +
+      "M12,2L14.39,5.42C13.65,5.15 12.84,5 12,5C11.16,5 10.35,5.15 9.61,5.42" +
+      "L12,2M3.34,7L7.5,6.65C6.9,7.16 6.36,7.78 5.94,8.5C5.5,9.24 5.25,10 5.11,10.79" +
+      "L3.34,7M3.36,17L5.12,13.23C5.26,14 5.53,14.78 5.95,15.5C6.37,16.24 6.91,16.86 7.5,17.37" +
+      "L3.36,17M20.65,7L18.88,10.79C18.74,10 18.47,9.23 18.05,8.5C17.63,7.78 17.1,7.15 16.5,6.64" +
+      "L20.65,7M20.64,17L16.5,17.36C17.09,16.85 17.62,16.22 18.04,15.5C18.46,14.77 18.73,14 18.87,13.21" +
+      "L20.64,17M12,22L9.59,18.56C10.33,18.83 11.14,19 12,19C12.82,19 13.63,18.83 14.37,18.56" +
+      "L12,22Z";
+    return `
+      <svg viewBox="0 0 24 24" class="sg-sun-svg" aria-hidden="true">
+        <path d="${MDI_SUNNY}"/>
+      </svg>`;
   }
 
   _makeControlButton(path, label, service) {
@@ -315,14 +382,31 @@ class ShutterGroupCard extends HTMLElement {
       cell.icon.innerHTML = shutterSvg(pct, overlay);
       cell.label.textContent = label;
     });
+
+    // Sun-through indicator: yellow when the sensor is "on" (sun shining
+    // through), grey otherwise (off / unknown / unavailable).
+    if (this._sunEl) {
+      const on = this._stateOf(this._config.sun_through_entity) === "on";
+      this._sunEl.classList.toggle("sg-sun-on", on);
+    }
   }
 
   _styles() {
+    const c = CONFIG;
+    const labelDisplay = c.showLabels ? "block" : "none";
+    // Shutter icon dimensions: one configurable size (width); height derives
+    // from the SVG's native 48:58 aspect ratio so the shape never distorts.
+    const iconW = c.shutterIconSize;
+    const iconH = Math.round(c.shutterIconSize * (58 / 48));
+    // Vertically center the sun icon on the shutter ICON (not the whole member
+    // column, which also includes the label below). The icon sits at the top
+    // of the column, so the sun's center should match the icon's center.
+    const sunTopNudge = Math.max(0, Math.round((iconH - c.sunIconSize) / 2));
     return `
       <style>
         ha-card { padding: 12px 16px 14px; }
         .sg-title {
-          font-size: 1.1rem;
+          font-size: ${c.titleFontSize};
           font-weight: 500;
           margin-bottom: 10px;
           color: var(--primary-text-color);
@@ -335,32 +419,32 @@ class ShutterGroupCard extends HTMLElement {
         .sg-members {
           display: flex;
           flex-wrap: wrap;
-          gap: 18px;
-          flex: 1 1 auto;
+          gap: ${c.memberGap}px;
+          flex: 0 1 auto;
         }
         .sg-member {
           display: flex;
           flex-direction: column;
           align-items: center;
-          min-width: 56px;
+          min-width: ${Math.max(iconW + 12, 40)}px;
         }
-        .sg-icon { width: 33px; height: 40px; }
+        .sg-icon { width: ${iconW}px; height: ${iconH}px; }
         .sg-svg { width: 100%; height: 100%; display: block; }
         .sg-frame {
           fill: none;
-          stroke: var(--primary-color);
+          stroke: ${c.shutterColor};
           stroke-width: 1.5;
           opacity: 0.85;
         }
         .sg-rail {
-          fill: var(--primary-color);
+          fill: ${c.shutterColor};
         }
         .sg-slat {
-          fill: var(--primary-color);
+          fill: ${c.shutterColor};
           opacity: 0.85;
         }
         .sg-ov { fill: var(--primary-text-color); }
-        .sg-ov-move { fill: var(--primary-color); }
+        .sg-ov-move { fill: ${c.shutterColor}; }
         .sg-ov-queued { fill: var(--secondary-text-color); stroke: none; }
         .sg-moving .sg-slat { animation: sg-pulse 1.1s ease-in-out infinite; }
         .sg-queued { opacity: 0.55; }
@@ -369,28 +453,49 @@ class ShutterGroupCard extends HTMLElement {
           50% { opacity: 0.4; }
         }
         .sg-label {
+          display: ${labelDisplay};
           margin-top: 4px;
-          font-size: 0.8rem;
+          font-size: ${c.labelFontSize};
           font-weight: 500;
           color: var(--primary-text-color);
           white-space: nowrap;
         }
-        /* Replicate the tile card's cover-open-close feature button bar:
-           a horizontal ha-control-button-group of pill-shaped
-           ha-control-buttons. The feature uses ~42px tall buttons with
-           12px spacing and the 6xl (very rounded) corner radius. */
+        /* Sun-through indicator, between members and buttons. Aligned to the
+           top of the row and nudged down so its center matches the shutter
+           ICON's center (ignoring the label below the icons). */
+        .sg-sun {
+          flex: 0 0 auto;
+          align-self: flex-start;
+          margin-top: ${sunTopNudge}px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .sg-sun-svg {
+          width: ${c.sunIconSize}px;
+          height: ${c.sunIconSize}px;
+          fill: ${c.sunOffColor};
+          transition: fill 0.3s ease;
+        }
+        .sg-sun.sg-sun-on .sg-sun-svg {
+          fill: ${c.sunOnColor};
+        }
+        /* Tile-style open/stop/close button group, pushed to the right edge so
+           the blank space sits AFTER the sun icon:
+           shutters - sun - [blank] - controls. */
         .sg-buttons {
           flex: 0 0 auto;
           align-self: center;
-          width: 180px;
-          height: 42px;
+          width: ${c.buttonGroupWidth}px;
+          height: ${c.buttonSize}px;
           --control-button-group-spacing: 12px;
-          --control-button-group-thickness: 42px;
+          --control-button-group-thickness: ${c.buttonSize}px;
+          margin-left: auto;
         }
         .sg-buttons ha-control-button {
           --control-button-border-radius: var(--ha-border-radius-6xl, 28px);
-          --mdc-icon-size: 24px;
-          --control-button-icon-color: var(--primary-text-color);
+          --mdc-icon-size: ${c.buttonIconSize}px;
+          --control-button-icon-color: ${c.buttonIconColor};
         }
       </style>`;
   }
