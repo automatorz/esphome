@@ -361,6 +361,14 @@ async def _gen_input_pin(coord, chip, board_id, chip_id, pin, name_prefix, locat
     cg.add(var.set_chip(chip))
     cg.add(var.set_pin(pin))
     cg.add(var.set_inverted(inverted))
+    # Mark the pin as an input on the chip at CODEGEN time, so the chip's
+    # input_mask_ is fully populated before any setup() runs. The C++
+    # binary_sensor setup() also calls set_pin_input, but relying on that is a
+    # setup-ordering trap: the chip's setup() reads input_mask_ to program
+    # IODIR/GPINTEN, and if it runs before all its binary_sensors have set up,
+    # interrupts are only enabled for a subset of pins (observed: chip only
+    # recognized 2 of 8 inputs). Setting it here removes the ordering dependency.
+    cg.add(chip.set_pin_input(pin))
 
 
 async def _gen_switch_pin(
@@ -387,6 +395,9 @@ async def _gen_switch_pin(
     await cg.register_component(var, conf)
     cg.add(var.set_chip(chip))
     cg.add(var.set_pin(pin))
+    # Explicitly mark as output at codegen time (chip defaults to output, but be
+    # explicit so input_mask_ is unambiguous regardless of setup ordering).
+    cg.add(chip.set_pin_output(pin))
     # Record the switch var by its name so a nested shutter_hub can resolve
     # up_relay/down_relay references (e.g. "sw02_chip01_pin15") to this var.
     if switch_map is not None:
@@ -412,6 +423,8 @@ async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
     cg.add(out_var.set_chip(chip))
     cg.add(out_var.set_pin(pin))
     cg.add(out_var.set_inverted(inverted))
+    # Mark as output on the chip at codegen time (ordering-independent).
+    cg.add(chip.set_pin_output(pin))
 
     from esphome.components.binary.light import (
         BinaryLightOutput,
