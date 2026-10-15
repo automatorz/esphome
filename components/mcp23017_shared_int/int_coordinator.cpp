@@ -62,6 +62,17 @@ void SharedIntCoordinator::loop() {
 }
 
 void SharedIntCoordinator::service_once_() {
+  // Defensive sizing: last_level_ is indexed in parallel with listeners_. It is
+  // seeded in setup(), but a listener may register in its own setup() AFTER the
+  // coordinator's setup() ran (setup-priority ordering is not guaranteed to put
+  // every listener first). If that happens, listeners_ is larger than
+  // last_level_ and the indexed write below would run off the end of the
+  // vector<bool> and crash (LoadProhibited). Grow last_level_ to match before
+  // use so it always covers every registered listener.
+  if (this->last_level_.size() < this->listeners_.size()) {
+    this->last_level_.resize(this->listeners_.size(), false);
+  }
+
   // Read each chip once (one 16-bit GPIO read per chip, which also clears that
   // chip's latch), then push changed levels to listeners belonging to it.
   for (auto *chip : this->chips_) {
