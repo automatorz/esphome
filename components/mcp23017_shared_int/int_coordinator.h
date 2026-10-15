@@ -4,6 +4,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/log.h"
 #include "mcp23017_shared_int.h"
 
 namespace esphome {
@@ -32,7 +33,11 @@ class SharedIntCoordinator : public Component {
 
   void set_interrupt_pin(InternalGPIOPin *pin) { this->interrupt_pin_ = pin; }
   void register_chip(MCP23017Chip *chip) { this->chips_.push_back(chip); }
-  void register_listener(InputPinListener *listener) { this->listeners_.push_back(listener); }
+  void register_listener(InputPinListener *listener) {
+    this->listeners_.push_back(listener);
+    ESP_LOGD("mcp23017_shared_int.coord", "register_listener #%u",
+             (unsigned) this->listeners_.size());
+  }
 
  protected:
   static void IRAM_ATTR gpio_intr(SharedIntCoordinator *arg) { arg->enable_loop_soon_any_context(); }
