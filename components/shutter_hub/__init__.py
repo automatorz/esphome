@@ -106,6 +106,32 @@ CONFIG_SCHEMA = cv.Schema({
 }).extend(cv.COMPONENT_SCHEMA)
 
 
+# ---------------------------------------------------------------------------
+# Nested-use schema (for mcp23017_shared_int, which embeds a `shutter_hub:`
+# block and generates the relay switches itself).
+#
+# Identical to CONFIG_SCHEMA except up_relay/down_relay are plain STRINGS (the
+# generated `sw...` switch names), not use_id references. The embedding
+# component resolves those names against its own board-generated switch map in
+# codegen, so there is no validation-phase cross-component ID lookup (which
+# cannot see entities created in another component's to_code).
+# ---------------------------------------------------------------------------
+NESTED_SHUTTER_SCHEMA = SHUTTER_SCHEMA.extend({
+    cv.Required(CONF_UP_RELAY): cv.string,
+    cv.Required(CONF_DOWN_RELAY): cv.string,
+})
+
+NESTED_CONFIG_SCHEMA = cv.Schema({
+    cv.GenerateID(): cv.declare_id(ShutterHub),
+    cv.Required(CONF_SUN_AZ): cv.use_id(sensor.Sensor),
+    cv.Required(CONF_SUN_EL): cv.use_id(sensor.Sensor),
+    cv.Optional(CONF_HEATING): cv.use_id(binary_sensor.BinarySensor),
+    cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
+    cv.Required(CONF_SHUTTERS): cv.ensure_list(NESTED_SHUTTER_SCHEMA),
+    cv.Optional(CONF_GROUPS, default=[]): cv.ensure_list(GROUP_SCHEMA),
+}).extend(cv.COMPONENT_SCHEMA)
+
+
 def _declare_entity_id(obj_id, cls):
     """Build a unique declaration ID for an entity synthesized at codegen time.
 
@@ -125,6 +151,26 @@ def _declare_entity_id(obj_id, cls):
 
 
 async def to_code(config):
+    # Standalone use: relays are resolved as normal switch IDs via use_id.
+    await build_shutter_hub(config)
+
+
+async def build_shutter_hub(config, relay_resolver=None):
+    """Generate the full ShutterHub graph (hub, shutters, groups, telemetry).
+
+    Shared by the standalone `shutter_hub:` component and by
+    `mcp23017_shared_int`, which nests this config and generates the relay
+    switches itself. ``relay_resolver`` maps an up_relay/down_relay reference to
+    the switch var to wire. When None (standalone), relays are plain switch IDs
+    resolved via cg.get_variable (the original behavior). When provided (nested
+    in mcp23017_shared_int), the reference is a `sw...` name string resolved
+    against the board-generated switch map, so no validation-phase use_id is
+    needed.
+    """
+    if relay_resolver is None:
+        async def relay_resolver(ref):
+            return await cg.get_variable(ref)
+
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
@@ -139,8 +185,8 @@ async def to_code(config):
         sv = await cover.new_cover(s)
         cg.add(sv.set_hub(var))
         cg.add(sv.set_index(i))
-        cg.add(sv.set_up_relay(await cg.get_variable(s[CONF_UP_RELAY])))
-        cg.add(sv.set_down_relay(await cg.get_variable(s[CONF_DOWN_RELAY])))
+        cg.add(sv.set_up_relay(await relay_resolver(s[CONF_UP_RELAY])))
+        cg.add(sv.set_down_relay(await relay_resolver(s[CONF_DOWN_RELAY])))
         cg.add(sv.set_travel_time(s[CONF_TRAVEL_TIME]))
         cg.add(sv.set_restore(s[CONF_RESTORE]))
 

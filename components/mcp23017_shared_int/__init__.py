@@ -54,8 +54,25 @@ from esphome.const import (
 
 CODEOWNERS = ["@automatorz"]
 DEPENDENCIES = ["i2c"]
-AUTO_LOAD = ["binary_sensor", "switch", "output", "light"]
+AUTO_LOAD = [
+    "binary_sensor",
+    "switch",
+    "output",
+    "light",
+    # Needed by the embedded shutter_hub (which we do NOT AUTO_LOAD, so its own
+    # AUTO_LOAD chain doesn't run): cover entities + the shutter telemetry
+    # text_sensor/sensor. Harmless when no shutter_hub block is present.
+    "cover",
+    "text_sensor",
+    "sensor",
+]
 MULTI_CONF = False
+
+# NOTE: shutter_hub is deliberately NOT in AUTO_LOAD. It is a regular component
+# whose schema requires keys (sun_azimuth, etc.), so auto-loading it injects an
+# empty top-level `shutter_hub:` section that fails validation. We instead embed
+# its config under our own `shutter_hub:` key and, when present, copy its C++
+# sources in to_code via _ensure_shutter_hub_sources() (see below).
 
 mcp23017_shared_int_ns = cg.esphome_ns.namespace("mcp23017_shared_int")
 
@@ -91,6 +108,7 @@ CONF_PINS = "pins"
 CONF_ROLE = "role"
 CONF_ON_BUTTONS = "on_buttons"
 CONF_OFF_BUTTONS = "off_buttons"
+CONF_SHUTTER_HUB = "shutter_hub"
 
 DIR_INPUT = "input"
 DIR_OUTPUT = "output"
@@ -254,6 +272,14 @@ def _validate_at_least_one(config):
     return config
 
 
+def _shutter_hub_schema(value):
+    # Lazily reference the sibling component's nested schema so the import only
+    # happens when a shutter_hub: block is actually present.
+    from esphome.components.shutter_hub import NESTED_CONFIG_SCHEMA
+
+    return NESTED_CONFIG_SCHEMA(value)
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -265,6 +291,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_BOARDS): cv.All(
                 cv.ensure_list(BOARD_SCHEMA), cv.Length(min=1, max=16)
             ),
+            # Optional embedded shutter_hub. Uses the shutter_hub component's
+            # nested schema (up_relay/down_relay are plain `sw...` name strings
+            # resolved against this component's generated switches in codegen).
+            cv.Optional(CONF_SHUTTER_HUB): _shutter_hub_schema,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     _validate_at_least_one,
@@ -334,7 +364,8 @@ async def _gen_input_pin(coord, chip, board_id, chip_id, pin, name_prefix, locat
 
 
 async def _gen_switch_pin(
-    chip, board_id, chip_id, pin, name_prefix, location, bank_inverted, pin_conf
+    chip, board_id, chip_id, pin, name_prefix, location, bank_inverted, pin_conf,
+    switch_map=None,
 ):
     pin2 = f"{pin:02d}"
     inverted = pin_conf.get(CONF_INVERTED, bank_inverted)
@@ -356,6 +387,10 @@ async def _gen_switch_pin(
     await cg.register_component(var, conf)
     cg.add(var.set_chip(chip))
     cg.add(var.set_pin(pin))
+    # Record the switch var by its name so a nested shutter_hub can resolve
+    # up_relay/down_relay references (e.g. "sw02_chip01_pin15") to this var.
+    if switch_map is not None:
+        switch_map[sw_id] = var
 
 
 async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
@@ -401,7 +436,9 @@ async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
     await binary_light_to_code(conf)
 
 
-async def _gen_bank(coord, chip, board_id, chip_id, chip_index, bank_conf, is_bank_a):
+async def _gen_bank(
+    coord, chip, board_id, chip_id, chip_index, bank_conf, is_bank_a, switch_map=None
+):
     direction = bank_conf[CONF_DIRECTION]
     bank_inverted = bank_conf[CONF_INVERTED]
     name_prefix = bank_conf.get(CONF_NAME_PREFIX)
@@ -427,11 +464,11 @@ async def _gen_bank(coord, chip, board_id, chip_id, chip_index, bank_conf, is_ba
             else:
                 await _gen_switch_pin(
                     chip, board_id, chip_id, pin, prefix, location, bank_inverted,
-                    pin_conf,
+                    pin_conf, switch_map=switch_map,
                 )
 
 
-async def _gen_board(coord, board_conf):
+async def _gen_board(coord, board_conf, switch_map=None):
     board_id = board_conf[CONF_BOARD_ID]
     addresses = [board_conf[CONF_CHIP1_ADDRESS], board_conf[CONF_CHIP2_ADDRESS]]
 
@@ -450,10 +487,12 @@ async def _gen_board(coord, board_conf):
         cg.add(coord.register_chip(chip))
 
         await _gen_bank(
-            coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_A], True
+            coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_A], True,
+            switch_map=switch_map,
         )
         await _gen_bank(
-            coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_B], False
+            coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_B], False,
+            switch_map=switch_map,
         )
 
 
@@ -505,6 +544,37 @@ async def to_code(config):
         await i2c.register_i2c_device(chip, chip_conf)
         cg.add(coord.register_chip(chip))
 
-    # High-level boards
+    # High-level boards. Accumulate a name -> switch var map so a nested
+    # shutter_hub can resolve up_relay/down_relay references ("sw...") to the
+    # actual generated MCP23017Switch vars (no cross-component use_id needed).
+    switch_map = {}
     for board_conf in config.get(CONF_BOARDS, []):
-        await _gen_board(coord, board_conf)
+        await _gen_board(coord, board_conf, switch_map=switch_map)
+
+    # Embedded shutter_hub (optional). Boards are already expanded above, so the
+    # switch_map is fully populated before we wire the shutters.
+    if CONF_SHUTTER_HUB in config:
+        # Ensure shutter_hub's C++ sources get copied into the build. Its
+        # entities are generated by build_shutter_hub below (not by a top-level
+        # shutter_hub: section), so it is not otherwise in CORE.config. Adding a
+        # sentinel key here (during codegen, after validation) makes the writer
+        # copy its resources without running shutter_hub's own schema/to_code.
+        if "shutter_hub" not in CORE.config:
+            CORE.config["shutter_hub"] = []
+        CORE.loaded_integrations.add("shutter_hub")
+
+        from esphome.components.shutter_hub import build_shutter_hub
+
+        async def _resolve_relay(ref):
+            if ref not in switch_map:
+                raise cv.Invalid(
+                    f"shutter_hub relay '{ref}' does not match any generated "
+                    f"output switch. It must be the id of an output-direction "
+                    f"pin generated by this component's boards (e.g. "
+                    f"'sw<board>_chip<cc>_pin<pp>')."
+                )
+            return switch_map[ref]
+
+        await build_shutter_hub(
+            config[CONF_SHUTTER_HUB], relay_resolver=_resolve_relay
+        )
