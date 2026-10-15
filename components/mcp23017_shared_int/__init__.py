@@ -37,7 +37,7 @@ A board expands into:
 
 from esphome import pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, i2c, switch
+from esphome.components import binary_sensor, i2c, light, output, switch
 import esphome.config_validation as cv
 from esphome.core import CORE, ID
 from esphome.const import (
@@ -47,11 +47,14 @@ from esphome.const import (
     CONF_INTERRUPT_PIN,
     CONF_INVERTED,
     CONF_NAME,
+    CONF_OUTPUT,
+    CONF_OUTPUT_ID,
+    CONF_RESTORE_MODE,
 )
 
 CODEOWNERS = ["@automatorz"]
 DEPENDENCIES = ["i2c"]
-AUTO_LOAD = ["binary_sensor", "switch"]
+AUTO_LOAD = ["binary_sensor", "switch", "output", "light"]
 MULTI_CONF = False
 
 mcp23017_shared_int_ns = cg.esphome_ns.namespace("mcp23017_shared_int")
@@ -68,6 +71,9 @@ MCP23017BinarySensor = mcp23017_shared_int_ns.class_(
 MCP23017Switch = mcp23017_shared_int_ns.class_(
     "MCP23017Switch", switch.Switch, cg.Component
 )
+MCP23017Output = mcp23017_shared_int_ns.class_(
+    "MCP23017Output", output.BinaryOutput, cg.Component
+)
 
 # --- config keys ---
 CONF_CHIPS = "chips"
@@ -81,9 +87,20 @@ CONF_BANK_B = "bank_b"
 CONF_NAME_PREFIX = "name_prefix"
 CONF_LOCATION_PREFIX = "location_prefix"
 CONF_LOCATIONS = "locations"
+CONF_PINS = "pins"
+CONF_ROLE = "role"
+CONF_ON_BUTTONS = "on_buttons"
+CONF_OFF_BUTTONS = "off_buttons"
 
 DIR_INPUT = "input"
 DIR_OUTPUT = "output"
+
+ROLE_SWITCH = "switch"
+ROLE_LIGHT = "light"
+
+# Default restore modes (parity with mcp23017_boards).
+DEFAULT_SWITCH_RESTORE_MODE = "RESTORE_DEFAULT_OFF"
+DEFAULT_LIGHT_RESTORE_MODE = "RESTORE_DEFAULT_OFF"
 
 # Default Home Assistant name prefixes for auto-generated bank entities.
 # The "ZZ" prefix on outputs makes them sort last alphabetically in Home
@@ -104,6 +121,58 @@ CHIP_SCHEMA = cv.Schema(
 # ---------------------------------------------------------------------------
 # High-level board / bank schema
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Per-pin override schema (output banks only) — parity with mcp23017_boards.
+# ---------------------------------------------------------------------------
+_PIN_SCHEMA = cv.Schema(
+    {
+        cv.Optional(CONF_ROLE, default=ROLE_SWITCH): cv.one_of(
+            ROLE_SWITCH, ROLE_LIGHT, lower=True
+        ),
+        cv.Optional(CONF_ID): cv.string,
+        cv.Optional(CONF_NAME): cv.string,
+        cv.Optional(CONF_RESTORE_MODE): cv.string,
+        cv.Optional(CONF_INVERTED): cv.boolean,
+        cv.Optional(CONF_ON_BUTTONS): cv.ensure_list(cv.string),
+        cv.Optional(CONF_OFF_BUTTONS): cv.ensure_list(cv.string),
+    }
+)
+
+
+def _validate_pin(value):
+    value = _PIN_SCHEMA(value)
+    role = value[CONF_ROLE]
+    if role == ROLE_LIGHT:
+        if CONF_ID not in value:
+            raise cv.Invalid("A 'light' pin requires an explicit 'id'.")
+        if CONF_NAME not in value:
+            raise cv.Invalid("A 'light' pin requires an explicit 'name'.")
+    else:
+        for key in (CONF_ON_BUTTONS, CONF_OFF_BUTTONS):
+            if key in value:
+                raise cv.Invalid(f"'{key}' is only valid for 'light' pins.")
+    return value
+
+
+_CHIP_IDS = ("01", "02")
+
+
+def _normalize_chip_key(value):
+    if isinstance(value, bool):
+        raise cv.Invalid(f"Invalid chip key {value!r}; expected '01'/'02' or 1/2.")
+    if isinstance(value, int):
+        text = f"{value:02d}"
+    else:
+        text = str(value).strip()
+        if text in ("1", "2"):
+            text = f"0{text}"
+    if text not in _CHIP_IDS:
+        raise cv.Invalid(
+            f"Invalid chip key {value!r}; expected one of '01'/'02' (or 1/2)."
+        )
+    return text
+
+
 def _bank_schema(default_location_prefix, default_name_prefix):
     return cv.Schema(
         {
@@ -120,8 +189,45 @@ def _bank_schema(default_location_prefix, default_name_prefix):
             cv.Optional(CONF_LOCATIONS): cv.All(
                 cv.ensure_list(cv.string), cv.Length(min=16, max=16)
             ),
+            # Per-pin role/override map, nested by CHIP then physical pin.
+            # Output banks only (rejected on inputs in _make_validate_bank).
+            cv.Optional(CONF_PINS): cv.Schema(
+                {cv.string: cv.Schema({cv.int_: _validate_pin})}
+            ),
         }
     )
+
+
+def _make_validate_bank(is_bank_a):
+    pin_base, pin_bound = (0, 7) if is_bank_a else (8, 15)
+    bank_label = "bank_a (Bottom)" if is_bank_a else "bank_b (Top)"
+
+    def _validate_bank(value):
+        if value[CONF_DIRECTION] == DIR_INPUT and value.get(CONF_PINS):
+            raise cv.Invalid("'pins' overrides are only valid for output banks.")
+        pins_conf = value.get(CONF_PINS)
+        if pins_conf:
+            normalized = {}
+            for chip_key, chip_pins in pins_conf.items():
+                chip_id = _normalize_chip_key(chip_key)
+                if chip_id in normalized:
+                    raise cv.Invalid(
+                        f"Chip {chip_id} is declared more than once in "
+                        f"{bank_label} 'pins'."
+                    )
+                seen = {}
+                for pin, pin_conf in chip_pins.items():
+                    if not pin_base <= pin <= pin_bound:
+                        raise cv.Invalid(
+                            f"Pin {pin} is out of range for {bank_label} on "
+                            f"chip {chip_id}; valid pins are {pin_base}..{pin_bound}."
+                        )
+                    seen[pin] = pin_conf
+                normalized[chip_id] = seen
+            value[CONF_PINS] = normalized
+        return value
+
+    return _validate_bank
 
 
 BOARD_SCHEMA = cv.Schema(
@@ -130,8 +236,12 @@ BOARD_SCHEMA = cv.Schema(
         cv.Required(CONF_I2C_ID): cv.use_id(i2c.I2CBus),
         cv.Optional(CONF_CHIP1_ADDRESS, default=0x20): cv.i2c_address,
         cv.Optional(CONF_CHIP2_ADDRESS, default=0x21): cv.i2c_address,
-        cv.Required(CONF_BANK_A): _bank_schema("Bottom", "HAS"),
-        cv.Required(CONF_BANK_B): _bank_schema("Top", "HAS"),
+        cv.Required(CONF_BANK_A): cv.All(
+            _bank_schema("Bottom", "HAS"), _make_validate_bank(True)
+        ),
+        cv.Required(CONF_BANK_B): cv.All(
+            _bank_schema("Top", "HAS"), _make_validate_bank(False)
+        ),
     }
 )
 
@@ -223,17 +333,24 @@ async def _gen_input_pin(coord, chip, board_id, chip_id, pin, name_prefix, locat
     cg.add(var.set_inverted(inverted))
 
 
-async def _gen_output_pin(chip, board_id, chip_id, pin, name_prefix, location, inverted):
+async def _gen_switch_pin(
+    chip, board_id, chip_id, pin, name_prefix, location, bank_inverted, pin_conf
+):
     pin2 = f"{pin:02d}"
-    name = f"{name_prefix} Board{board_id} {location} (Chip{chip_id} Pin{pin2})"
-    obj_id = f"sw{board_id}_chip{chip_id}_pin{pin2}"
+    inverted = pin_conf.get(CONF_INVERTED, bank_inverted)
+    sw_id = pin_conf.get(CONF_ID, f"sw{board_id}_chip{chip_id}_pin{pin2}")
+    name = pin_conf.get(
+        CONF_NAME,
+        f"{name_prefix} Board{board_id} {location} (Chip{chip_id} Pin{pin2})",
+    )
+    restore_mode = pin_conf.get(CONF_RESTORE_MODE, DEFAULT_SWITCH_RESTORE_MODE)
 
     conf = {
-        CONF_ID: _declare_component_id(obj_id, MCP23017Switch),
+        CONF_ID: _declare_component_id(sw_id, MCP23017Switch),
         CONF_NAME: name,
         CONF_INVERTED: inverted,
     }
-    conf = switch.switch_schema(MCP23017Switch, default_restore_mode="ALWAYS_OFF")(conf)
+    conf = switch.switch_schema(MCP23017Switch, default_restore_mode=restore_mode)(conf)
 
     var = await switch.new_switch(conf)
     await cg.register_component(var, conf)
@@ -241,10 +358,54 @@ async def _gen_output_pin(chip, board_id, chip_id, pin, name_prefix, location, i
     cg.add(var.set_pin(pin))
 
 
+async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
+    """Generate an MCP23017Output and wrap it in a stock binary light.
+
+    Uses our own MCP23017Output (an output::BinaryOutput that writes via the
+    hub), so there is no dependency on stock gpio platform sources — only the
+    stock `binary` light + `light`/`output` domains, which we AUTO_LOAD.
+    """
+    pin2 = f"{pin:02d}"
+    inverted = pin_conf.get(CONF_INVERTED, bank_inverted)
+    light_id = pin_conf[CONF_ID]
+    name = pin_conf[CONF_NAME]
+    restore_mode = pin_conf.get(CONF_RESTORE_MODE, DEFAULT_LIGHT_RESTORE_MODE)
+
+    out_id = f"{light_id}_mcpout"
+    out_var = cg.new_Pvariable(_declare_component_id(out_id, MCP23017Output))
+    await cg.register_component(out_var, {})
+    cg.add(out_var.set_chip(chip))
+    cg.add(out_var.set_pin(pin))
+    cg.add(out_var.set_inverted(inverted))
+
+    from esphome.components.binary.light import (
+        BinaryLightOutput,
+        CONFIG_SCHEMA as BINARY_LIGHT_SCHEMA,
+        to_code as binary_light_to_code,
+    )
+    from esphome.components.light.types import LightState
+
+    light_var_id = _declare_component_id(light_id, LightState)
+    binary_out_id = _declare_component_id(f"{light_id}_binaryout", BinaryLightOutput)
+
+    conf = {
+        CONF_OUTPUT_ID: binary_out_id,
+        CONF_ID: light_var_id,
+        CONF_NAME: name,
+        CONF_RESTORE_MODE: restore_mode,
+        CONF_OUTPUT: out_id,
+    }
+    conf = BINARY_LIGHT_SCHEMA(conf)
+    # The binary light's to_code resolves CONF_OUTPUT via get_variable; our
+    # out_var is already registered under out_id so it resolves cleanly.
+    await binary_light_to_code(conf)
+
+
 async def _gen_bank(coord, chip, board_id, chip_id, chip_index, bank_conf, is_bank_a):
     direction = bank_conf[CONF_DIRECTION]
-    inverted = bank_conf[CONF_INVERTED]
+    bank_inverted = bank_conf[CONF_INVERTED]
     name_prefix = bank_conf.get(CONF_NAME_PREFIX)
+    pins_conf = bank_conf.get(CONF_PINS, {})
 
     pin_base = 0 if is_bank_a else 8
     for i in range(8):
@@ -253,13 +414,21 @@ async def _gen_bank(coord, chip, board_id, chip_id, chip_index, bank_conf, is_ba
         if direction == DIR_INPUT:
             prefix = name_prefix if name_prefix is not None else DEFAULT_INPUT_NAME_PREFIX
             await _gen_input_pin(
-                coord, chip, board_id, chip_id, pin, prefix, location, inverted
+                coord, chip, board_id, chip_id, pin, prefix, location, bank_inverted
             )
         else:
             prefix = name_prefix if name_prefix is not None else DEFAULT_OUTPUT_NAME_PREFIX
-            await _gen_output_pin(
-                chip, board_id, chip_id, pin, prefix, location, inverted
-            )
+            # Per-pin override (nested chip -> pin). No entry -> default switch.
+            pin_conf = pins_conf.get(chip_id, {}).get(pin, {CONF_ROLE: ROLE_SWITCH})
+            if pin_conf[CONF_ROLE] == ROLE_LIGHT:
+                await _gen_light_pin(
+                    chip, board_id, chip_id, pin, bank_inverted, pin_conf
+                )
+            else:
+                await _gen_switch_pin(
+                    chip, board_id, chip_id, pin, prefix, location, bank_inverted,
+                    pin_conf,
+                )
 
 
 async def _gen_board(coord, board_conf):
@@ -288,7 +457,41 @@ async def _gen_board(coord, board_conf):
         )
 
 
+def _ensure_binary_light_sources():
+    """Ensure the stock `binary` light platform's C++ sources are copied.
+
+    Light-role pins wrap our MCP23017Output in a stock `light: platform: binary`
+    (binary::BinaryLightOutput). esphome copies a platform's sources only when a
+    `{platform: X}` entry exists under that domain in CORE.config (see
+    config.iter_components). We generate the light via to_code directly, so no
+    such entry exists and binary's header is never copied ("'binary' has not
+    been declared"). Inject a minimal marker entry so the writer copies it.
+    Only needed when at least one light pin is generated; harmless otherwise.
+    """
+    from esphome.const import CONF_PLATFORM
+
+    entries = CORE.config.setdefault("light", [])
+    if not any(
+        isinstance(e, dict) and e.get(CONF_PLATFORM) == "binary" for e in entries
+    ):
+        entries.append({CONF_PLATFORM: "binary"})
+    CORE.loaded_integrations.add("light")
+
+
+def _config_has_light(config):
+    for board_conf in config.get(CONF_BOARDS, []):
+        for bank in (board_conf[CONF_BANK_A], board_conf[CONF_BANK_B]):
+            for chip_pins in bank.get(CONF_PINS, {}).values():
+                for pin_conf in chip_pins.values():
+                    if pin_conf.get(CONF_ROLE) == ROLE_LIGHT:
+                        return True
+    return False
+
+
 async def to_code(config):
+    if _config_has_light(config):
+        _ensure_binary_light_sources()
+
     coord = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(coord, config)
 
