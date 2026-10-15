@@ -369,6 +369,11 @@ async def _gen_input_pin(coord, chip, board_id, chip_id, pin, name_prefix, locat
     # interrupts are only enabled for a subset of pins (observed: chip only
     # recognized 2 of 8 inputs). Setting it here removes the ordering dependency.
     cg.add(chip.set_pin_input(pin))
+    # Register this sensor as a coordinator listener at CODEGEN time (not from
+    # the C++ setup()), so listeners_ is deterministically complete before any
+    # setup() runs — mirroring the set_pin_input ordering fix above and the
+    # existing cg.add(coord.register_chip(chip)) pattern.
+    cg.add(coord.register_listener(var))
 
 
 async def _gen_switch_pin(

@@ -23,10 +23,10 @@ class MCP23017BinarySensor : public binary_sensor::BinarySensor,
   void set_coordinator(SharedIntCoordinator *coord) { this->coordinator_ = coord; }
 
   void setup() override {
-    // Register with the chip as an input and with the coordinator as a listener.
-    this->chip_->set_pin_input(this->pin_);
-    if (this->coordinator_ != nullptr)
-      this->coordinator_->register_listener(this);
+    // Nothing to do here: the chip input mask and the coordinator listener
+    // registration are both wired at CODEGEN time in __init__.py::_gen_input_pin,
+    // so no ordering-dependent work remains. The class still needs to be a
+    // Component (see get_setup_priority).
   }
 
   void dump_config() override;
