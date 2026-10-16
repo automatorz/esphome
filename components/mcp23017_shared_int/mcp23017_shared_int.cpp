@@ -16,14 +16,13 @@ bool MCP23017Chip::write_verify_(uint8_t reg, uint8_t value) {
     uint8_t readback = 0;
     if (this->read_reg_(reg, &readback) && readback == value)
       return true;
-    ESP_LOGW(TAG,
-             "0x%02X reg 0x%02X write/verify attempt %d failed (wrote 0x%02X, "
-             "read 0x%02X); retrying",
-             this->address_, reg, attempt, value, readback);
+    diag_setup_logf("DIAG-SETUP: 0x%02X reg 0x%02X write/verify attempt %d FAILED "
+                    "(wrote 0x%02X, read 0x%02X); retrying",
+                    this->address_, reg, attempt, value, readback);
     delay(2);
   }
-  ESP_LOGE(TAG, "0x%02X reg 0x%02X failed to verify after retries", this->address_,
-           reg);
+  diag_setup_logf("DIAG-SETUP: 0x%02X reg 0x%02X FAILED to verify after retries",
+                  this->address_, reg);
   return false;
 }
 
@@ -32,10 +31,9 @@ static int g_chip_setup_order = 0;
 
 void MCP23017Chip::setup() {
   g_chip_setup_order++;
-  ESP_LOGW(TAG,
-           "DIAG-SETUP: MCP23017 0x%02X setup() CALLED (order #%d, "
-           "setup_priority=%.1f)",
-           this->address_, g_chip_setup_order, this->get_setup_priority());
+  diag_setup_logf("DIAG-SETUP: MCP23017 0x%02X setup() CALLED (order #%d, "
+                  "setup_priority=%.1f)",
+                  this->address_, g_chip_setup_order, this->get_setup_priority());
   ESP_LOGCONFIG(TAG, "Setting up MCP23017 at 0x%02X ...", this->address_);
 
   const uint16_t input_mask = this->input_mask_;

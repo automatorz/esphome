@@ -44,6 +44,11 @@ static constexpr uint8_t IOCON_ODR = 0x04;     // INT output is open-drain (requ
 
 class SharedIntCoordinator;  // forward decl
 
+// TEMP DIAGNOSTIC: capture a setup-phase log line into a shared buffer that the
+// coordinator replays after the API logger is up (so it reaches network logs).
+// Defined in int_coordinator.cpp.
+void diag_setup_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 // A single MCP23017 chip. Mixed input/output: `input_mask_` has a 1 bit for each
 // pin configured as an input. Interrupts (GPINTEN) are enabled on input pins only.
 //

@@ -1,16 +1,38 @@
 #include "int_coordinator.h"
 #include "esphome/core/log.h"
 
+#include <cstdarg>
+#include <cstdio>
+#include <string>
+#include <vector>
+
 namespace esphome {
 namespace mcp23017_shared_int {
 
 static const char *const TAG = "mcp23017_shared_int.coord";
 
+// TEMP DIAGNOSTIC: shared buffer for setup-phase messages. These are captured
+// during setup() (before the API/network is up, so they'd normally only reach
+// USB) and replayed via a delayed timer AFTER the API logger is connected, so
+// they show up in the ESPHome network/web logs. Shared across the chip and
+// coordinator classes via the free functions below.
+static std::vector<std::string> g_diag_setup_log;
+
+void diag_setup_logf(const char *fmt, ...) {
+  char buf[192];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  g_diag_setup_log.emplace_back(buf);
+  // Also emit immediately (reaches USB during setup; harmless if nobody reads).
+  ESP_LOGW(TAG, "%s", buf);
+}
+
 void SharedIntCoordinator::setup() {
-  ESP_LOGW(TAG,
-           "DIAG-SETUP: coordinator setup() CALLED (setup_priority=%.1f). "
-           "Chips registered so far: %u",
-           this->get_setup_priority(), (unsigned) this->chips_.size());
+  diag_setup_logf("DIAG-SETUP: coordinator setup() CALLED (setup_priority=%.1f). "
+                  "Chips registered so far: %u",
+                  this->get_setup_priority(), (unsigned) this->chips_.size());
   ESP_LOGCONFIG(TAG, "Setting up shared-interrupt coordinator ...");
 
   // NOTE on ordering: listeners (binary sensors) register themselves from their
@@ -53,6 +75,17 @@ void SharedIntCoordinator::setup() {
   this->diag_low_seen_.assign(this->chips_.size(), 0);
   this->set_interval("mcp_diag_fast", 50, [this]() { this->diag_fast_(); });
   this->set_interval("mcp_diag", 1000, [this]() { this->diag_poll_(); });
+
+  // TEMP DIAGNOSTIC: replay the captured setup-phase log 15 s after boot, by
+  // which time the API logger is connected, so the setup-order/priority lines
+  // reach the ESPHome network/web logs (no USB needed). One-shot.
+  this->set_timeout("mcp_diag_replay", 15000, []() {
+    ESP_LOGW(TAG, "===== DIAG-SETUP replay (captured during setup, %u lines) =====",
+             (unsigned) g_diag_setup_log.size());
+    for (auto &line : g_diag_setup_log)
+      ESP_LOGW(TAG, "%s", line.c_str());
+    ESP_LOGW(TAG, "===== end DIAG-SETUP replay =====");
+  });
 }
 
 void SharedIntCoordinator::diag_fast_() {
