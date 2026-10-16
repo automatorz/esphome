@@ -407,6 +407,10 @@ async def _gen_switch_pin(
     # Explicitly mark as output at codegen time (chip defaults to output, but be
     # explicit so input_mask_ is unambiguous regardless of setup ordering).
     cg.add(chip.set_pin_output(pin))
+    # Tell the chip this output pin's OFF hardware level so configure_hardware()
+    # pre-loads OLAT and the relay doesn't glitch ON at boot. For an inverted
+    # switch, logical-off = hardware-high.
+    cg.add(chip.set_output_off_level(pin, inverted))
     # Record the switch var by its name so a nested shutter_hub can resolve
     # up_relay/down_relay references (e.g. "sw02_chip01_pin15") to this var.
     if switch_map is not None:
@@ -434,6 +438,8 @@ async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
     cg.add(out_var.set_inverted(inverted))
     # Mark as output on the chip at codegen time (ordering-independent).
     cg.add(chip.set_pin_output(pin))
+    # Pre-load OLAT off-level so the light output doesn't glitch on at boot.
+    cg.add(chip.set_output_off_level(pin, inverted))
 
     from esphome.components.binary.light import (
         BinaryLightOutput,

@@ -70,6 +70,20 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
   void set_pin_output(uint8_t pin) { this->input_mask_ &= ~(uint16_t(1) << pin); }
   uint16_t get_input_mask() const { return this->input_mask_; }
 
+  // Declared at codegen time for OUTPUT pins: the hardware level that means
+  // "off" for this pin. For an inverted output (relay logical-off = hardware
+  // high) pass off_level_high=true. configure_hardware() pre-loads OLAT with
+  // these levels BEFORE switching the pins to outputs, so relays never glitch
+  // to the energized state at boot (previously OLAT powered up at 0x00 = low =
+  // ON for inverted relays, driving every shutter relay on until the switch
+  // component's restore ran). pin in [0,15].
+  void set_output_off_level(uint8_t pin, bool off_level_high) {
+    if (off_level_high)
+      this->output_off_mask_ |= (uint16_t(1) << pin);
+    else
+      this->output_off_mask_ &= ~(uint16_t(1) << pin);
+  }
+
   // Read all 16 input bits from GPIOA/GPIOB. Reading GPIO clears the chip's
   // latched interrupt and releases its pull on the shared INT line.
   // Returns true on success; `out` holds the 16-bit port value (A = low byte).
@@ -95,6 +109,9 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
 
   // Bit = 1 means the pin is an INPUT. Outputs are the complement.
   uint16_t input_mask_{0x0000};
+  // Bit = 1 means this output pin's "off" hardware level is HIGH (inverted
+  // output). Used to pre-load OLAT before enabling outputs so relays start off.
+  uint16_t output_off_mask_{0x0000};
   // Cached OLAT so output writes don't need a read first.
   uint8_t olat_a_{0x00};
   uint8_t olat_b_{0x00};

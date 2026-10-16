@@ -49,7 +49,19 @@ bool MCP23017Chip::configure_hardware() {
   this->write_verify_(REG_IOCONA, iocon);
   this->write_verify_(REG_IOCONB, iocon);
 
-  // --- Direction: IODIR bit 1 = input, 0 = output ---
+  // --- Pre-load OLAT with each output pin's OFF level BEFORE switching pins to
+  //     outputs. Otherwise OLAT powers up at 0x00 (all low); for inverted
+  //     relays (off = hardware high) that drives every relay ON the instant
+  //     IODIR makes the pin an output, so all shutter relays energize at boot.
+  //     Writing OLAT first means the pin is already at its off level when it
+  //     becomes an output - no glitch. output_off_mask_ bit=1 => off is HIGH. ---
+  this->olat_a_ = uint8_t(this->output_off_mask_ & 0xFF);
+  this->olat_b_ = uint8_t((this->output_off_mask_ >> 8) & 0xFF);
+  this->write_verify_(REG_OLATA, this->olat_a_);
+  this->write_verify_(REG_OLATB, this->olat_b_);
+
+  // --- Direction: IODIR bit 1 = input, 0 = output. Pins become outputs now,
+  //     already driving the OLAT off-levels written just above. ---
   if (!this->write_verify_(REG_IODIRA, idir_a) ||
       !this->write_verify_(REG_IODIRB, idir_b)) {
     this->mark_failed();
@@ -72,9 +84,8 @@ bool MCP23017Chip::configure_hardware() {
   this->write_verify_(REG_GPINTENA, idir_a);
   this->write_verify_(REG_GPINTENB, idir_b);
 
-  // --- Seed cached OLAT from hardware so the first write is coherent. ---
-  this->read_reg_(REG_OLATA, &this->olat_a_);
-  this->read_reg_(REG_OLATB, &this->olat_b_);
+  // NOTE: olat_a_/olat_b_ already hold the off-levels we wrote above; no need to
+  // re-seed from hardware (that would just read back what we just wrote).
 
   // --- Clear any pending interrupt latched at power-on by reading GPIO. This
   //     also releases this chip's pull on the shared INT line if it was low. ---
