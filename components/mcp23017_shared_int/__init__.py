@@ -37,7 +37,15 @@ A board expands into:
 
 from esphome import automation, pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, i2c, light, output, sun, switch
+from esphome.components import (
+    binary_sensor,
+    i2c,
+    light,
+    output,
+    sun,
+    switch,
+    text_sensor,
+)
 import esphome.config_validation as cv
 from esphome.core import CORE, ID, Lambda
 from esphome.const import (
@@ -65,6 +73,13 @@ AUTO_LOAD = [
     "cover",
     "text_sensor",
     "sensor",
+    # ha_light_hub is an embedded sibling with NO top-level CONFIG_SCHEMA/to_code
+    # (only NESTED_CONFIG_SCHEMA + build_ha_light_hub, consumed from our codegen).
+    # AUTO_LOADing it is safe (it injects no failing top-level section, unlike
+    # shutter_hub which DOES have a required top-level schema and so is kept out
+    # of AUTO_LOAD). This makes `from esphome.components.ha_light_hub import ...`
+    # resolve without the user listing ha_light_hub in external_components.
+    "ha_light_hub",
 ]
 MULTI_CONF = False
 
@@ -91,10 +106,13 @@ MCP23017Switch = mcp23017_shared_int_ns.class_(
 MCP23017Output = mcp23017_shared_int_ns.class_(
     "MCP23017Output", output.BinaryOutput, cg.Component
 )
-# Plain (NON-Component) helper driven by two native sun::SunTriggers. It is a
-# cg.new_Pvariable object, NOT registered as a component and NOT counted toward
-# ESPHOME_COMPONENT_COUNT.
-SunScheduleHandler = mcp23017_shared_int_ns.class_("SunScheduleHandler")
+# Helper driven by two native sun::SunTriggers. It is ALSO a PollingComponent
+# (it publishes the two always-on "next sunset/sunrise" text_sensors on a cheap
+# 60s cadence), so it IS registered as a component and IS counted toward
+# ESPHOME_COMPONENT_COUNT (see _fabricated_sun_schedule_ids).
+SunScheduleHandler = mcp23017_shared_int_ns.class_(
+    "SunScheduleHandler", cg.PollingComponent
+)
 
 # --- config keys ---
 CONF_CHIPS = "chips"
@@ -751,23 +769,37 @@ def _fabricated_shutter_hub_ids(config):
             yield sanitize(snake_case(f"{base_name}_position"))
 
 
-# Deterministic ids for the two SunTriggers synthesized by the sun_schedule
-# path. These are the ONLY Component-derived objects added by sun_schedule, so
-# ONLY these two must be counted toward ESPHOME_COMPONENT_COUNT. The handler
-# object, the two Automations and the two lambda actions are NOT Components and
+# Deterministic ids for the Component-derived objects synthesized by the
+# sun_schedule path. These must ALL be counted toward ESPHOME_COMPONENT_COUNT
+# because each becomes an App.register_component_ / App.register_text_sensor
+# entry. The two Automations and the two lambda actions are NOT Components and
 # are NOT yielded here (counting them would over-count the fixed array).
+#   * two native sun::SunTriggers (PollingComponents)
+#   * the SunScheduleHandler itself (now a PollingComponent)
+#   * the two always-on "next sunset/sunrise" text_sensors (fabricated at
+#     codegen like the shutter_hub telemetry text_sensors)
 _SUN_TRIGGER_SUNSET_ID = "mcp_sun_trigger_sunset"
 _SUN_TRIGGER_SUNRISE_ID = "mcp_sun_trigger_sunrise"
+_SUN_SCHEDULE_HANDLER_ID = "mcp_sun_schedule"
+_SUN_NEXT_SUNSET_SENSOR_ID = "mcp_sun_next_sunset"
+_SUN_NEXT_SUNRISE_SENSOR_ID = "mcp_sun_next_sunrise"
 
 
 def _fabricated_sun_schedule_ids(config):
-    """Yield the Component ids fabricated by the sun_schedule path (exactly the
-    two sun::SunTriggers) so they are counted before ESPHOME_COMPONENT_COUNT is
-    frozen. Nothing else on this path is a Component."""
+    """Yield the Component ids fabricated by the sun_schedule path so they are
+    counted before ESPHOME_COMPONENT_COUNT is frozen: the two sun::SunTriggers,
+    the SunScheduleHandler (a PollingComponent), and the two next-event
+    text_sensors. The two text_sensors are declared the SAME way the shutter_hub
+    telemetry text_sensors are (sanitize(snake_case(...)) base names)."""
     if CONF_SUN_SCHEDULE not in config:
         return
+    from esphome.helpers import sanitize, snake_case
+
     yield _SUN_TRIGGER_SUNSET_ID
     yield _SUN_TRIGGER_SUNRISE_ID
+    yield _SUN_SCHEDULE_HANDLER_ID
+    yield sanitize(snake_case(_SUN_NEXT_SUNSET_SENSOR_ID))
+    yield sanitize(snake_case(_SUN_NEXT_SUNRISE_SENSOR_ID))
 
 
 def _final_validate(config):
@@ -924,12 +956,61 @@ async def to_code(config):
                 "sun_schedule requires a 'sun:' component in the configuration."
             ) from err
 
-        # The handler is a plain object (NOT a Component): no register_component,
-        # not counted toward ESPHOME_COMPONENT_COUNT.
-        handler_id = ID(
-            "mcp_sun_schedule", is_declaration=True, type=SunScheduleHandler
+        elevation = sun_cfg[CONF_ELEVATION]
+
+        # The handler is now a PollingComponent (it publishes the two always-on
+        # "next sunset/sunrise" text_sensors), so it must be registered and is
+        # counted toward ESPHOME_COMPONENT_COUNT (see _fabricated_sun_schedule_ids).
+        handler_id = _declare_component_id(
+            _SUN_SCHEDULE_HANDLER_ID, SunScheduleHandler
         )
         handler = cg.new_Pvariable(handler_id)
+        await cg.register_component(handler, {})
+        cg.add(handler.set_sun(sun_var))
+        cg.add(handler.set_elevation(elevation))
+
+        # Two always-on text_sensors reporting the wall-clock time of day
+        # (HH:MM:SS) of the next sunset / sunrise at the SAME elevation that
+        # drives the triggers. Fabricated at codegen exactly like the
+        # shutter_hub telemetry text_sensors (minted id + new_text_sensor).
+        from esphome.helpers import sanitize, snake_case
+
+        # A text_sensor is registered via App.register_text_sensor (NOT
+        # App.register_component_), so its id is NOT consumed from
+        # CORE.component_ids. Mint a plain declaration ID (like shutter_hub's
+        # _declare_entity_id) rather than _declare_component_id, which is for
+        # true Components.
+        sunset_sensor_id = ID(
+            sanitize(snake_case(_SUN_NEXT_SUNSET_SENSOR_ID)),
+            is_declaration=True,
+            type=text_sensor.TextSensor,
+        )
+        sunset_sensor_conf = text_sensor.text_sensor_schema(
+            icon="mdi:weather-sunset-down",
+        )(
+            {
+                CONF_ID: sunset_sensor_id,
+                CONF_NAME: "Next Sunset",
+            }
+        )
+        next_sunset_sensor = await text_sensor.new_text_sensor(sunset_sensor_conf)
+        cg.add(handler.set_next_sunset_sensor(next_sunset_sensor))
+
+        sunrise_sensor_id = ID(
+            sanitize(snake_case(_SUN_NEXT_SUNRISE_SENSOR_ID)),
+            is_declaration=True,
+            type=text_sensor.TextSensor,
+        )
+        sunrise_sensor_conf = text_sensor.text_sensor_schema(
+            icon="mdi:weather-sunset-up",
+        )(
+            {
+                CONF_ID: sunrise_sensor_id,
+                CONF_NAME: "Next Sunrise",
+            }
+        )
+        next_sunrise_sensor = await text_sensor.new_text_sensor(sunrise_sensor_conf)
+        cg.add(handler.set_next_sunrise_sensor(next_sunrise_sensor))
 
         # Wire per-light sun actions, resolving each light id via light_map.
         for light_id, sunset_action, sunrise_action in sun_light_specs:
@@ -957,10 +1038,9 @@ async def to_code(config):
             cg.add(handler.set_shutter_hub(shutter_hub_var))
 
         # Build the two native SunTriggers + Automations + lambda actions. The
-        # SunTriggers are the ONLY Component-derived objects (counted via
-        # _fabricated_sun_schedule_ids). The automations and lambda actions get
-        # unique minted ids but are NOT counted.
-        elevation = sun_cfg[CONF_ELEVATION]
+        # SunTriggers are counted via _fabricated_sun_schedule_ids (as are the
+        # handler and the two text_sensors above). The automations and lambda
+        # actions get unique minted ids but are NOT counted.
         handler_name = str(handler)
 
         for direction, trigger_obj_id, is_sunrise in (
