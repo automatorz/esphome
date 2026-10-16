@@ -69,6 +69,10 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
   // Optional: read INTF to learn which pins caused the interrupt (A = low byte).
   bool read_intf(uint16_t *out);
 
+  // Read INTCAP (value captured at the moment of the last interrupt; A = low
+  // byte). Reading INTCAP clears the interrupt condition just like reading GPIO.
+  bool read_intcap(uint16_t *out);
+
   // Write a single output pin. No-op semantics are left to the caller; this
   // writes OLAT and caches it so we never read-modify-write over I2C per toggle.
   void write_output(uint8_t pin, bool value);
