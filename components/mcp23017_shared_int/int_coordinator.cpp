@@ -37,12 +37,33 @@ void SharedIntCoordinator::setup() {
   this->force_initial_publish_ = true;
   this->enable_loop();
 
-  // TEMP DIAGNOSTIC: poll independent of the interrupt path. We DO NOT clear the
-  // chip latch here (no GPIO/INTCAP read), so any momentary press that latches
-  // INTF stays latched and accumulates in diag_intf_seen_ until you power-cycle.
-  // Press buttons whenever; the sticky mask makes timing irrelevant.
+  // TEMP DIAGNOSTIC.
+  // Sticky accumulators (per chip), reset only on power-cycle:
+  //   diag_intf_seen_   : OR of every INTF (interrupt-on-change flag) ever read.
+  //   diag_low_seen_    : for each INPUT pin, set if GPIO ever read it LOW.
+  // The fast 50 ms poll reads GPIO directly (independent of interrupt-on-change)
+  // so a brief momentary press is caught on the raw level even if the chip's
+  // interrupt latch never fires. The 1 s poll dumps INTF, the sticky masks, and
+  // reads back the key config registers to confirm they actually took.
   this->diag_intf_seen_.assign(this->chips_.size(), 0);
+  this->diag_low_seen_.assign(this->chips_.size(), 0);
+  this->set_interval("mcp_diag_fast", 50, [this]() { this->diag_fast_(); });
   this->set_interval("mcp_diag", 1000, [this]() { this->diag_poll_(); });
+}
+
+void SharedIntCoordinator::diag_fast_() {
+  if (this->diag_low_seen_.size() < this->chips_.size())
+    this->diag_low_seen_.resize(this->chips_.size(), 0);
+  size_t idx = 0;
+  for (auto *chip : this->chips_) {
+    uint16_t port = 0;
+    if (chip->read_inputs(&port)) {
+      const uint16_t mask = chip->get_input_mask();
+      // A pin currently LOW: bits where (port==0) within the input mask.
+      this->diag_low_seen_[idx] |= (uint16_t) (~port & mask);
+    }
+    idx++;
+  }
 }
 
 void SharedIntCoordinator::diag_poll_() {
@@ -55,22 +76,35 @@ void SharedIntCoordinator::diag_poll_() {
     this->diag_intf_seen_.resize(this->chips_.size(), 0);
   size_t idx = 0;
   for (auto *chip : this->chips_) {
-    const uint16_t mask = chip->get_input_mask();
-    // Read INTF ONLY (non-clearing). We deliberately do NOT read GPIO or INTCAP
-    // on the diagnostic path, so the chip's latch is never cleared by us. Any
-    // press that ever latches stays latched and accumulates in the sticky mask.
     uint16_t intf = 0;
-    const bool ok_intf = chip->read_intf(&intf);
+    chip->read_intf(&intf);
     this->diag_intf_seen_[idx] |= intf;
+    // Read back the key config registers (bank A low byte) to confirm the
+    // setup() writes actually stuck: IODIR (1=input), GPINTEN (1=int enabled),
+    // INTCON (0=compare-to-previous), IOCON (should have MIRROR|ODR bits).
+    uint8_t iodir = 0xEE, gpinten = 0xEE, intcon = 0xEE, iocon = 0xEE;
+    chip->diag_read_reg(0x00, &iodir);     // REG_IODIRA
+    chip->diag_read_reg(0x04, &gpinten);   // REG_GPINTENA
+    chip->diag_read_reg(0x08, &intcon);    // REG_INTCONA
+    chip->diag_read_reg(0x0A, &iocon);     // REG_IOCONA
     ESP_LOGD(TAG,
-             "DIAG: chip[%u] 0x%02X intf_ok=%s INTF=0x%04X  intf_seen=0x%04X",
-             (unsigned) idx, chip->get_i2c_address(), ok_intf ? "y" : "N", intf,
-             this->diag_intf_seen_[idx]);
+             "DIAG: chip[%u] 0x%02X intf=0x%04X intf_seen=0x%04X "
+             "gpio_low_seen=0x%04X | IODIRA=0x%02X GPINTENA=0x%02X "
+             "INTCONA=0x%02X IOCONA=0x%02X",
+             (unsigned) idx, chip->get_i2c_address(), intf,
+             this->diag_intf_seen_[idx], this->diag_low_seen_[idx], iodir,
+             gpinten, intcon, iocon);
+    if (this->diag_low_seen_[idx] != 0)
+      ESP_LOGW(TAG,
+               "DIAG: chip[%u] 0x%02X GPIO saw an input go LOW "
+               "(gpio_low_seen=0x%04X) -> the input pin IS moving on press.",
+               (unsigned) idx, chip->get_i2c_address(),
+               this->diag_low_seen_[idx]);
     if (this->diag_intf_seen_[idx] != 0)
       ESP_LOGW(TAG,
-               "DIAG: chip[%u] 0x%02X HAS LATCHED a change since boot "
-               "(intf_seen=0x%04X) -> this chip IS detecting presses; the "
-               "interrupt just isn't reaching the ESP.",
+               "DIAG: chip[%u] 0x%02X interrupt-on-change LATCHED "
+               "(intf_seen=0x%04X) -> chip's INT hardware works; signal just "
+               "isn't reaching the ESP.",
                (unsigned) idx, chip->get_i2c_address(),
                this->diag_intf_seen_[idx]);
     idx++;

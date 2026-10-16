@@ -55,7 +55,9 @@ class SharedIntCoordinator : public Component {
   // every interrupt flag seen since boot, so a press at any time stays visible
   // regardless of poll timing. Remove once inputs work.
   void diag_poll_();
-  std::vector<uint16_t> diag_intf_seen_;
+  void diag_fast_();
+  std::vector<uint16_t> diag_intf_seen_;  // sticky OR of every INTF read
+  std::vector<uint16_t> diag_low_seen_;   // sticky: input pins ever seen LOW on GPIO
 
   // Read all chips once and dispatch to listeners. Returns true if any chip read
   // failed (so we can decide whether to keep retrying).

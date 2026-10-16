@@ -73,6 +73,9 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
   // byte). Reading INTCAP clears the interrupt condition just like reading GPIO.
   bool read_intcap(uint16_t *out);
 
+  // TEMP DIAGNOSTIC: read back a single config register for verification.
+  bool diag_read_reg(uint8_t reg, uint8_t *value) { return this->read_reg_(reg, value); }
+
   // Write a single output pin. No-op semantics are left to the caller; this
   // writes OLAT and caches it so we never read-modify-write over I2C per toggle.
   void write_output(uint8_t pin, bool value);
