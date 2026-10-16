@@ -11,13 +11,16 @@ void MCP23017BinarySensor::on_pin_state(bool level) {
   this->publish_state(logical);
 
   // Momentary-button -> light wiring. Act only on the OFF->ON (press) edge, not
-  // on release, and not repeatedly while held. If no light is wired, this is a
-  // no-op beyond tracking the edge.
-  if (this->light_ != nullptr && logical && !this->last_logical_) {
-    if (this->light_turns_on_) {
-      this->light_->turn_on().perform();
-    } else {
-      this->light_->turn_off().perform();
+  // on release, and not repeatedly while held. Fire every wired light action
+  // (one button may drive several lights in any mix of on/off). If none are
+  // wired, this is a no-op beyond tracking the edge.
+  if (logical && !this->last_logical_) {
+    for (const auto &action : this->light_actions_) {
+      if (action.turns_on) {
+        action.light->turn_on().perform();
+      } else {
+        action.light->turn_off().perform();
+      }
     }
   }
   this->last_logical_ = logical;

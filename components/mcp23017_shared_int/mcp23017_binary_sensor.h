@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vector>
+
 #include "esphome/core/component.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 #include "esphome/components/light/light_state.h"
@@ -30,18 +32,18 @@ class MCP23017BinarySensor : public binary_sensor::BinarySensor,
   }
   void set_coordinator(SharedIntCoordinator *coord) { this->coordinator_ = coord; }
 
-  // Wire this input (as a momentary button) to a light. On the OFF->ON (press)
-  // edge of this sensor's logical state, the light is turned on / off. A given
-  // input maps to at most one light action (enforced at codegen), so a single
-  // pointer + intent flag is sufficient. Fully push-driven: fires from
-  // on_pin_state(), which the coordinator calls on an interrupt — no polling.
+  // Wire this input (as a momentary button) to one or more lights. On the
+  // OFF->ON (press) edge of this sensor's logical state, every wired light is
+  // turned on / off per its recorded intent. A single input may drive several
+  // lights in any mix of on/off (e.g. one wall button turns one light ON and
+  // another OFF), so these accumulate into a list rather than overwrite. Fully
+  // push-driven: fires from on_pin_state(), which the coordinator calls on an
+  // interrupt — no polling.
   void set_light_on(light::LightState *light) {
-    this->light_ = light;
-    this->light_turns_on_ = true;
+    this->light_actions_.push_back(LightAction{light, true});
   }
   void set_light_off(light::LightState *light) {
-    this->light_ = light;
-    this->light_turns_on_ = false;
+    this->light_actions_.push_back(LightAction{light, false});
   }
 
   void setup() override {
@@ -65,10 +67,14 @@ class MCP23017BinarySensor : public binary_sensor::BinarySensor,
   SharedIntCoordinator *coordinator_{nullptr};
   uint8_t pin_{0};
   bool inverted_{false};
-  // Button->light wiring (optional). light_ stays nullptr when this input is
-  // not wired to a light, in which case on_pin_state() only publishes state.
-  light::LightState *light_{nullptr};
-  bool light_turns_on_{false};
+  // Button->light wiring (optional). Empty when this input is not wired to any
+  // light, in which case on_pin_state() only publishes state. One button may
+  // drive multiple lights (any mix of on/off).
+  struct LightAction {
+    light::LightState *light;
+    bool turns_on;
+  };
+  std::vector<LightAction> light_actions_;
   // Previous logical (post-inversion) state, used to detect the press edge.
   bool last_logical_{false};
 };

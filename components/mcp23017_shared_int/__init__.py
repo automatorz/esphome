@@ -482,20 +482,14 @@ async def _gen_light_pin(
 
 def _collect_button_links(pin_conf, button_links):
     """Append (light_id, light_name, button_id, is_on) rows for one light pin's
-    on_buttons/off_buttons, enforcing the invariant that a given button maps to
-    at most one light action (across all lights). Raises cv.Invalid on conflict.
-    Resolution to actual sensor vars happens after the board loop."""
+    on_buttons/off_buttons. A single button MAY drive multiple lights in any mix
+    of on/off (e.g. one wall button turns one light on and another off), so no
+    one-button-one-light restriction is imposed. Resolution to actual sensor
+    vars happens after the board loop; the C++ side accumulates the actions."""
     light_id = pin_conf[CONF_ID]
     light_name = pin_conf[CONF_NAME]
     for key, is_on in ((CONF_ON_BUTTONS, True), (CONF_OFF_BUTTONS, False)):
         for button_id in pin_conf.get(key, []):
-            for prev_light_id, _prev_name, prev_button, _prev_is_on in button_links:
-                if prev_button == button_id:
-                    raise cv.Invalid(
-                        f"Button '{button_id}' is referenced by more than one "
-                        f"light (lights '{prev_light_id}' and '{light_id}'). A "
-                        f"button may control at most one light's on or off."
-                    )
             button_links.append((light_id, light_name, button_id, is_on))
 
 
