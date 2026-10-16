@@ -348,7 +348,10 @@ def _declare_component_id(obj_id, cls):
     return the_id
 
 
-async def _gen_input_pin(coord, chip, board_id, chip_id, pin, name_prefix, location, inverted):
+async def _gen_input_pin(
+    coord, chip, board_id, chip_id, pin, name_prefix, location, inverted,
+    sensor_map=None,
+):
     pin2 = f"{pin:02d}"
     name = f"{name_prefix} Board{board_id} {location} (Chip{chip_id} Pin{pin2})"
     obj_id = f"has_board{board_id}_chip{chip_id}_pin{pin2}"
@@ -361,6 +364,10 @@ async def _gen_input_pin(coord, chip, board_id, chip_id, pin, name_prefix, locat
 
     var = await binary_sensor.new_binary_sensor(conf)
     await cg.register_component(var, conf)
+    # Record this input's var by its auto-generated id so a light's
+    # on_buttons/off_buttons can resolve to it after the board loop.
+    if sensor_map is not None:
+        sensor_map[obj_id] = var
     cg.add(var.set_coordinator(coord))
     cg.add(var.set_chip(chip))
     cg.add(var.set_pin(pin))
@@ -417,7 +424,9 @@ async def _gen_switch_pin(
         switch_map[sw_id] = var
 
 
-async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
+async def _gen_light_pin(
+    chip, board_id, chip_id, pin, bank_inverted, pin_conf, light_map=None
+):
     """Generate an MCP23017Output and wrap it in a stock binary light.
 
     Uses our own MCP23017Output (an output::BinaryOutput that writes via the
@@ -463,9 +472,36 @@ async def _gen_light_pin(chip, board_id, chip_id, pin, bank_inverted, pin_conf):
     # out_var is already registered under out_id so it resolves cleanly.
     await binary_light_to_code(conf)
 
+    # Record the generated LightState var so on_buttons/off_buttons can be wired
+    # to it after the board loop (the button sensors may not exist yet here).
+    # binary_light_to_code declared it under light_var_id; retrieve the var.
+    if light_map is not None:
+        light_var = await cg.get_variable(light_var_id)
+        light_map[light_id] = light_var
+
+
+def _collect_button_links(pin_conf, button_links):
+    """Append (light_id, light_name, button_id, is_on) rows for one light pin's
+    on_buttons/off_buttons, enforcing the invariant that a given button maps to
+    at most one light action (across all lights). Raises cv.Invalid on conflict.
+    Resolution to actual sensor vars happens after the board loop."""
+    light_id = pin_conf[CONF_ID]
+    light_name = pin_conf[CONF_NAME]
+    for key, is_on in ((CONF_ON_BUTTONS, True), (CONF_OFF_BUTTONS, False)):
+        for button_id in pin_conf.get(key, []):
+            for prev_light_id, _prev_name, prev_button, _prev_is_on in button_links:
+                if prev_button == button_id:
+                    raise cv.Invalid(
+                        f"Button '{button_id}' is referenced by more than one "
+                        f"light (lights '{prev_light_id}' and '{light_id}'). A "
+                        f"button may control at most one light's on or off."
+                    )
+            button_links.append((light_id, light_name, button_id, is_on))
+
 
 async def _gen_bank(
-    coord, chip, board_id, chip_id, chip_index, bank_conf, is_bank_a, switch_map=None
+    coord, chip, board_id, chip_id, chip_index, bank_conf, is_bank_a,
+    switch_map=None, sensor_map=None, light_map=None, button_links=None,
 ):
     direction = bank_conf[CONF_DIRECTION]
     bank_inverted = bank_conf[CONF_INVERTED]
@@ -479,7 +515,8 @@ async def _gen_bank(
         if direction == DIR_INPUT:
             prefix = name_prefix if name_prefix is not None else DEFAULT_INPUT_NAME_PREFIX
             await _gen_input_pin(
-                coord, chip, board_id, chip_id, pin, prefix, location, bank_inverted
+                coord, chip, board_id, chip_id, pin, prefix, location, bank_inverted,
+                sensor_map=sensor_map,
             )
         else:
             prefix = name_prefix if name_prefix is not None else DEFAULT_OUTPUT_NAME_PREFIX
@@ -487,8 +524,12 @@ async def _gen_bank(
             pin_conf = pins_conf.get(chip_id, {}).get(pin, {CONF_ROLE: ROLE_SWITCH})
             if pin_conf[CONF_ROLE] == ROLE_LIGHT:
                 await _gen_light_pin(
-                    chip, board_id, chip_id, pin, bank_inverted, pin_conf
+                    chip, board_id, chip_id, pin, bank_inverted, pin_conf,
+                    light_map=light_map,
                 )
+                # Collect the button->light intent now; resolve after the loop.
+                if button_links is not None:
+                    _collect_button_links(pin_conf, button_links)
             else:
                 await _gen_switch_pin(
                     chip, board_id, chip_id, pin, prefix, location, bank_inverted,
@@ -496,7 +537,10 @@ async def _gen_bank(
                 )
 
 
-async def _gen_board(coord, board_conf, switch_map=None):
+async def _gen_board(
+    coord, board_conf, switch_map=None, sensor_map=None, light_map=None,
+    button_links=None,
+):
     board_id = board_conf[CONF_BOARD_ID]
     addresses = [board_conf[CONF_CHIP1_ADDRESS], board_conf[CONF_CHIP2_ADDRESS]]
 
@@ -516,11 +560,13 @@ async def _gen_board(coord, board_conf, switch_map=None):
 
         await _gen_bank(
             coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_A], True,
-            switch_map=switch_map,
+            switch_map=switch_map, sensor_map=sensor_map, light_map=light_map,
+            button_links=button_links,
         )
         await _gen_bank(
             coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_B], False,
-            switch_map=switch_map,
+            switch_map=switch_map, sensor_map=sensor_map, light_map=light_map,
+            button_links=button_links,
         )
 
 
@@ -674,9 +720,48 @@ async def to_code(config):
     # High-level boards. Accumulate a name -> switch var map so a nested
     # shutter_hub can resolve up_relay/down_relay references ("sw...") to the
     # actual generated MCP23017Switch vars (no cross-component use_id needed).
+    #
+    # Also accumulate, mirroring switch_map:
+    #   sensor_map    : input id ("has_board..._pin..") -> MCP23017BinarySensor var
+    #   light_map     : light id -> light::LightState var
+    #   button_links  : (light_id, light_name, button_id, is_on) rows gathered
+    #                   from each light pin's on_buttons/off_buttons.
+    # These are resolved/wired AFTER the board loop (below), when every input
+    # sensor and light var exists (a light's buttons may live on another board).
+    #
+    # NOTE (Approach B): button->light wiring is done purely via C++ setters on
+    # the already-declared MCP23017BinarySensor vars (set_light_on/off). It
+    # fabricates NO new Component-derived objects and NO new declared ids, so
+    # ESPHOME_COMPONENT_COUNT and FINAL_VALIDATE_SCHEMA/_fabricated_component_ids
+    # need no changes.
     switch_map = {}
+    sensor_map = {}
+    light_map = {}
+    button_links = []
     for board_conf in config.get(CONF_BOARDS, []):
-        await _gen_board(coord, board_conf, switch_map=switch_map)
+        await _gen_board(
+            coord, board_conf, switch_map=switch_map, sensor_map=sensor_map,
+            light_map=light_map, button_links=button_links,
+        )
+
+    # Wire each light's on_buttons/off_buttons now that all input sensors and
+    # light vars exist. Resolve the button id against sensor_map and emit the
+    # C++ setter binding it to the light's LightState var.
+    for light_id, light_name, button_id, is_on in button_links:
+        sensor_var = sensor_map.get(button_id)
+        if sensor_var is None:
+            raise cv.Invalid(
+                f"Light '{light_id}' ({light_name}) references button "
+                f"'{button_id}' in its "
+                f"{'on_buttons' if is_on else 'off_buttons'}, but no input with "
+                f"that id was generated. It must be an auto-generated input id "
+                f"of the form 'has_board<bb>_chip<cc>_pin<pp>'."
+            )
+        light_var = light_map[light_id]
+        if is_on:
+            cg.add(sensor_var.set_light_on(light_var))
+        else:
+            cg.add(sensor_var.set_light_off(light_var))
 
     # Embedded shutter_hub (optional). Boards are already expanded above, so the
     # switch_map is fully populated before we wire the shutters.
