@@ -16,24 +16,25 @@ bool MCP23017Chip::write_verify_(uint8_t reg, uint8_t value) {
     uint8_t readback = 0;
     if (this->read_reg_(reg, &readback) && readback == value)
       return true;
-    diag_setup_logf("DIAG-SETUP: 0x%02X reg 0x%02X write/verify attempt %d FAILED "
-                    "(wrote 0x%02X, read 0x%02X); retrying",
-                    this->address_, reg, attempt, value, readback);
+    ESP_LOGW(TAG,
+             "0x%02X reg 0x%02X write/verify attempt %d FAILED "
+             "(wrote 0x%02X, read 0x%02X); retrying",
+             this->address_, reg, attempt, value, readback);
     delay(2);
   }
-  diag_setup_logf("DIAG-SETUP: 0x%02X reg 0x%02X FAILED to verify after retries",
-                  this->address_, reg);
+  ESP_LOGE(TAG, "0x%02X reg 0x%02X FAILED to verify after retries", this->address_,
+           reg);
   return false;
 }
 
-// TEMP DIAGNOSTIC: global counter of chip setup() calls, in call order.
-static int g_chip_setup_order = 0;
-
 void MCP23017Chip::setup() {
-  g_chip_setup_order++;
-  diag_setup_logf("DIAG-SETUP: MCP23017 0x%02X setup() CALLED (order #%d, "
-                  "setup_priority=%.1f)",
-                  this->address_, g_chip_setup_order, this->get_setup_priority());
+  // The chip's own setup() is not guaranteed to run (see configure_hardware()).
+  // When it does run, program the hardware here too so the chip is functional
+  // either way. The coordinator also calls configure_hardware() for every chip.
+  this->configure_hardware();
+}
+
+bool MCP23017Chip::configure_hardware() {
   ESP_LOGCONFIG(TAG, "Setting up MCP23017 at 0x%02X ...", this->address_);
 
   const uint16_t input_mask = this->input_mask_;
@@ -52,7 +53,7 @@ void MCP23017Chip::setup() {
   if (!this->write_verify_(REG_IODIRA, idir_a) ||
       !this->write_verify_(REG_IODIRB, idir_b)) {
     this->mark_failed();
-    return;
+    return false;
   }
 
   // --- Pull-ups: external pull-ups per design, so GPPU = 0 on all pins. ---
@@ -79,6 +80,7 @@ void MCP23017Chip::setup() {
   //     also releases this chip's pull on the shared INT line if it was low. ---
   uint16_t discard;
   this->read_inputs(&discard);
+  return true;
 }
 
 void MCP23017Chip::dump_config() {
@@ -98,8 +100,6 @@ bool MCP23017Chip::read_inputs(uint16_t *out) {
 }
 
 bool MCP23017Chip::read_intf(uint16_t *out) { return this->read_u16_(REG_INTFA, out); }
-
-bool MCP23017Chip::read_intcap(uint16_t *out) { return this->read_u16_(REG_INTCAPA, out); }
 
 void MCP23017Chip::write_output(uint8_t pin, bool value) {
   if (pin > 15)

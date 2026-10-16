@@ -41,23 +41,8 @@ class SharedIntCoordinator : public Component {
 
  protected:
   static void IRAM_ATTR gpio_intr(SharedIntCoordinator *arg) {
-    arg->isr_count_++;
     arg->enable_loop_soon_any_context();
   }
-
-  // TEMP DIAGNOSTIC: counts ISR fires on the shared INT pin. volatile because it
-  // is written from the ISR and read from loop/interval context. Remove with the
-  // diag_poll_() probe once the interrupt path is confirmed working.
-  volatile uint32_t isr_count_{0};
-
-  // TEMP DIAGNOSTIC: polled probe (1 Hz, independent of the ISR). Reads INTF
-  // only (never clears the latch) and accumulates a sticky per-chip mask of
-  // every interrupt flag seen since boot, so a press at any time stays visible
-  // regardless of poll timing. Remove once inputs work.
-  void diag_poll_();
-  void diag_fast_();
-  std::vector<uint16_t> diag_intf_seen_;  // sticky OR of every INTF read
-  std::vector<uint16_t> diag_low_seen_;   // sticky: input pins ever seen LOW on GPIO
 
   // Read all chips once and dispatch to listeners. Returns true if any chip read
   // failed (so we can decide whether to keep retrying).

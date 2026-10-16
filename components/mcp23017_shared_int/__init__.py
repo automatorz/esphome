@@ -338,7 +338,11 @@ def _declare_component_id(obj_id, cls):
     """Create a declaration ID for a Component synthesized at codegen time and
     register it in CORE.component_ids so cg.register_component() accepts it.
     (Normally cv.declare_id does this during config validation; our board pins
-    are generated after validation, so we register them here.)"""
+    are generated after validation, so we register them here.)
+
+    Adding to CORE.component_ids is idempotent (it's a set), so calling this at
+    codegen is safe even if _final_validate already declared the same id during
+    validation (see FINAL_VALIDATE_SCHEMA below)."""
     the_id = ID(obj_id, is_declaration=True, type=cls)
     CORE.component_ids.add(the_id.id)
     return the_id
@@ -543,6 +547,105 @@ def _config_has_light(config):
                     if pin_conf.get(CONF_ROLE) == ROLE_LIGHT:
                         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Root-cause fix (B1): declare fabricated component IDs during VALIDATION.
+#
+# ESPHome sizes its fixed component array from ESPHOME_COMPONENT_COUNT =
+# len(CORE.component_ids), captured during the core codegen stage
+# (@coroutine_with_priority(CoroPriority.CORE) in esphome/core/config.py). This
+# component fabricates ~130 components (board chips plus per-pin binary sensors,
+# switches, outputs and light helpers) during its OWN codegen, which runs at the
+# default priority (CoroPriority.COMPONENT) AFTER the count was already frozen.
+# Those IDs were therefore never counted, the array was undersized, and
+# StaticVector::push_back silently dropped every component past the capacity so
+# their setup()/loop() never ran.
+#
+# FINAL_VALIDATE_SCHEMA runs during config validation, i.e. before ANY codegen
+# stage. By declaring the IDs we will fabricate here, they are present in
+# CORE.component_ids when the core stage computes the count, so the array is
+# sized to fit them. At codegen, _declare_component_id adds the same IDs again
+# (idempotent on a set) and cg.register_component removes them as usual — all of
+# which happens after the count was taken, so the count stays correct.
+# ---------------------------------------------------------------------------
+def _fabricated_component_ids(config):
+    """Yield every component ID this integration fabricates at codegen time, in
+    the SAME form _gen_board/_gen_bank/_gen_*_pin produce them. Keep this in
+    lockstep with those generators."""
+    for board_conf in config.get(CONF_BOARDS, []):
+        board_id = board_conf[CONF_BOARD_ID]
+        for chip_index in range(2):
+            chip_id = f"{chip_index + 1:02d}"  # "01", "02"
+            # The chip component itself.
+            yield f"mcp23017_b{board_id}_c{chip_id}"
+            for is_bank_a, bank_conf in (
+                (True, board_conf[CONF_BANK_A]),
+                (False, board_conf[CONF_BANK_B]),
+            ):
+                direction = bank_conf[CONF_DIRECTION]
+                pins_conf = bank_conf.get(CONF_PINS, {})
+                pin_base = 0 if is_bank_a else 8
+                for i in range(8):
+                    pin = pin_base + i
+                    pin2 = f"{pin:02d}"
+                    if direction == DIR_INPUT:
+                        yield f"has_board{board_id}_chip{chip_id}_pin{pin2}"
+                    else:
+                        pin_conf = pins_conf.get(chip_id, {}).get(
+                            pin, {CONF_ROLE: ROLE_SWITCH}
+                        )
+                        if pin_conf[CONF_ROLE] == ROLE_LIGHT:
+                            light_id = pin_conf[CONF_ID]
+                            # Mirrors _gen_light_pin: output + light state +
+                            # binary-light output wrapper.
+                            yield f"{light_id}_mcpout"
+                            yield light_id
+                            yield f"{light_id}_binaryout"
+                        else:
+                            yield pin_conf.get(
+                                CONF_ID,
+                                f"sw{board_id}_chip{chip_id}_pin{pin2}",
+                            )
+
+
+def _fabricated_shutter_hub_ids(config):
+    """Yield the component IDs the embedded shutter_hub fabricates at codegen but
+    does NOT declare during validation: the per-shutter telemetry text_sensor /
+    sensor entities (built in shutter_hub.build_shutter_hub via _declare_entity_id).
+
+    The hub, shutters and groups themselves are declared by the nested
+    shutter_hub schema during validation, so they are already counted; only the
+    telemetry entities are created purely at codegen. The exact collision-resolved
+    name is produced at codegen; here we only need the COUNT to include them, so
+    we emit a deterministic base name per enabled telemetry entity."""
+    from esphome.helpers import sanitize, snake_case
+
+    sh = config.get(CONF_SHUTTER_HUB)
+    if not sh:
+        return
+    # Keys match shutter_hub's schema (CONF_SHUTTERS/CONF_STATUS_SENSOR/
+    # CONF_POSITION_SENSOR there). Both telemetry flags default True.
+    for shutter in sh.get("shutters", []):
+        base_name = shutter.get(CONF_NAME) or str(shutter[CONF_ID])
+        if shutter.get("status_sensor", True):
+            yield sanitize(snake_case(f"{base_name}_status"))
+        if shutter.get("position_sensor", True):
+            yield sanitize(snake_case(f"{base_name}_position"))
+
+
+def _final_validate(config):
+    # Declare every component ID this integration (and its embedded shutter_hub)
+    # fabricates at codegen, so CORE.component_ids reflects them before the core
+    # stage freezes ESPHOME_COMPONENT_COUNT. See the comment block above.
+    for obj_id in _fabricated_component_ids(config):
+        CORE.component_ids.add(obj_id)
+    for obj_id in _fabricated_shutter_hub_ids(config):
+        CORE.component_ids.add(obj_id)
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
 
 
 async def to_code(config):

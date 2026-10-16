@@ -1,39 +1,25 @@
 #include "int_coordinator.h"
 #include "esphome/core/log.h"
 
-#include <cstdarg>
-#include <cstdio>
-#include <string>
-#include <vector>
-
 namespace esphome {
 namespace mcp23017_shared_int {
 
 static const char *const TAG = "mcp23017_shared_int.coord";
 
-// TEMP DIAGNOSTIC: shared buffer for setup-phase messages. These are captured
-// during setup() (before the API/network is up, so they'd normally only reach
-// USB) and replayed via a delayed timer AFTER the API logger is connected, so
-// they show up in the ESPHome network/web logs. Shared across the chip and
-// coordinator classes via the free functions below.
-static std::vector<std::string> g_diag_setup_log;
-
-void diag_setup_logf(const char *fmt, ...) {
-  char buf[192];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  g_diag_setup_log.emplace_back(buf);
-  // Also emit immediately (reaches USB during setup; harmless if nobody reads).
-  ESP_LOGW(TAG, "%s", buf);
-}
-
 void SharedIntCoordinator::setup() {
-  diag_setup_logf("DIAG-SETUP: coordinator setup() CALLED (setup_priority=%.1f). "
-                  "Chips registered so far: %u",
-                  this->get_setup_priority(), (unsigned) this->chips_.size());
   ESP_LOGCONFIG(TAG, "Setting up shared-interrupt coordinator ...");
+
+  // One-time boot write burst: program every chip's config registers now, from
+  // a code path that reliably runs. A chip's own setup() may be silently
+  // skipped (ESPHome's fixed component array can be sized too small and drop
+  // chips registered past its capacity), leaving their interrupt registers
+  // unconfigured. The coordinator holds all chips in chips_ regardless, so we
+  // program them here. This must happen BEFORE the interrupt is attached and
+  // BEFORE enable_loop(), so no chip can assert INT before it is configured.
+  // This is NOT polling: it runs exactly once at boot.
+  for (auto *chip : this->chips_) {
+    chip->configure_hardware();
+  }
 
   // NOTE on ordering: listeners (binary sensors) register themselves from their
   // own setup(). To guarantee every listener has registered before we seed
@@ -62,90 +48,6 @@ void SharedIntCoordinator::setup() {
   // so all listener setup() calls have completed first.
   this->force_initial_publish_ = true;
   this->enable_loop();
-
-  // TEMP DIAGNOSTIC.
-  // Sticky accumulators (per chip), reset only on power-cycle:
-  //   diag_intf_seen_   : OR of every INTF (interrupt-on-change flag) ever read.
-  //   diag_low_seen_    : for each INPUT pin, set if GPIO ever read it LOW.
-  // The fast 50 ms poll reads GPIO directly (independent of interrupt-on-change)
-  // so a brief momentary press is caught on the raw level even if the chip's
-  // interrupt latch never fires. The 1 s poll dumps INTF, the sticky masks, and
-  // reads back the key config registers to confirm they actually took.
-  this->diag_intf_seen_.assign(this->chips_.size(), 0);
-  this->diag_low_seen_.assign(this->chips_.size(), 0);
-  this->set_interval("mcp_diag_fast", 50, [this]() { this->diag_fast_(); });
-  this->set_interval("mcp_diag", 1000, [this]() { this->diag_poll_(); });
-
-  // TEMP DIAGNOSTIC: replay the captured setup-phase log 15 s after boot, by
-  // which time the API logger is connected, so the setup-order/priority lines
-  // reach the ESPHome network/web logs (no USB needed). One-shot.
-  this->set_timeout("mcp_diag_replay", 15000, []() {
-    ESP_LOGW(TAG, "===== DIAG-SETUP replay (captured during setup, %u lines) =====",
-             (unsigned) g_diag_setup_log.size());
-    for (auto &line : g_diag_setup_log)
-      ESP_LOGW(TAG, "%s", line.c_str());
-    ESP_LOGW(TAG, "===== end DIAG-SETUP replay =====");
-  });
-}
-
-void SharedIntCoordinator::diag_fast_() {
-  if (this->diag_low_seen_.size() < this->chips_.size())
-    this->diag_low_seen_.resize(this->chips_.size(), 0);
-  size_t idx = 0;
-  for (auto *chip : this->chips_) {
-    uint16_t port = 0;
-    if (chip->read_inputs(&port)) {
-      const uint16_t mask = chip->get_input_mask();
-      // A pin currently LOW: bits where (port==0) within the input mask.
-      this->diag_low_seen_[idx] |= (uint16_t) (~port & mask);
-    }
-    idx++;
-  }
-}
-
-void SharedIntCoordinator::diag_poll_() {
-  const int level = (this->interrupt_pin_ != nullptr)
-                        ? (this->interrupt_pin_->digital_read() ? 1 : 0)
-                        : -1;
-  ESP_LOGD(TAG, "DIAG: INT pin level=%d  isr_count=%u  chips=%u", level,
-           (unsigned) this->isr_count_, (unsigned) this->chips_.size());
-  if (this->diag_intf_seen_.size() < this->chips_.size())
-    this->diag_intf_seen_.resize(this->chips_.size(), 0);
-  size_t idx = 0;
-  for (auto *chip : this->chips_) {
-    uint16_t intf = 0;
-    chip->read_intf(&intf);
-    this->diag_intf_seen_[idx] |= intf;
-    // Read back the key config registers (bank A low byte) to confirm the
-    // setup() writes actually stuck: IODIR (1=input), GPINTEN (1=int enabled),
-    // INTCON (0=compare-to-previous), IOCON (should have MIRROR|ODR bits).
-    uint8_t iodir = 0xEE, gpinten = 0xEE, intcon = 0xEE, iocon = 0xEE;
-    chip->diag_read_reg(0x00, &iodir);     // REG_IODIRA
-    chip->diag_read_reg(0x04, &gpinten);   // REG_GPINTENA
-    chip->diag_read_reg(0x08, &intcon);    // REG_INTCONA
-    chip->diag_read_reg(0x0A, &iocon);     // REG_IOCONA
-    ESP_LOGD(TAG,
-             "DIAG: chip[%u] 0x%02X intf=0x%04X intf_seen=0x%04X "
-             "gpio_low_seen=0x%04X | IODIRA=0x%02X GPINTENA=0x%02X "
-             "INTCONA=0x%02X IOCONA=0x%02X",
-             (unsigned) idx, chip->get_i2c_address(), intf,
-             this->diag_intf_seen_[idx], this->diag_low_seen_[idx], iodir,
-             gpinten, intcon, iocon);
-    if (this->diag_low_seen_[idx] != 0)
-      ESP_LOGW(TAG,
-               "DIAG: chip[%u] 0x%02X GPIO saw an input go LOW "
-               "(gpio_low_seen=0x%04X) -> the input pin IS moving on press.",
-               (unsigned) idx, chip->get_i2c_address(),
-               this->diag_low_seen_[idx]);
-    if (this->diag_intf_seen_[idx] != 0)
-      ESP_LOGW(TAG,
-               "DIAG: chip[%u] 0x%02X interrupt-on-change LATCHED "
-               "(intf_seen=0x%04X) -> chip's INT hardware works; signal just "
-               "isn't reaching the ESP.",
-               (unsigned) idx, chip->get_i2c_address(),
-               this->diag_intf_seen_[idx]);
-    idx++;
-  }
 }
 
 void SharedIntCoordinator::loop() {

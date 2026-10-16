@@ -44,11 +44,6 @@ static constexpr uint8_t IOCON_ODR = 0x04;     // INT output is open-drain (requ
 
 class SharedIntCoordinator;  // forward decl
 
-// TEMP DIAGNOSTIC: capture a setup-phase log line into a shared buffer that the
-// coordinator replays after the API logger is up (so it reaches network logs).
-// Defined in int_coordinator.cpp.
-void diag_setup_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
 // A single MCP23017 chip. Mixed input/output: `input_mask_` has a 1 bit for each
 // pin configured as an input. Interrupts (GPINTEN) are enabled on input pins only.
 //
@@ -60,6 +55,15 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
   float get_setup_priority() const override { return setup_priority::IO; }
   void setup() override;
   void dump_config() override;
+
+  // Program all config registers (IOCON/IODIR/GPPU/IPOL/INTCON/GPINTEN), seed
+  // OLAT and clear the power-on interrupt latch. Idempotent one-time boot write
+  // burst. The coordinator calls this for every chip from its own setup(),
+  // because this chip's setup() may never run (the component array can be sized
+  // too small and silently drop chips past its capacity). input_mask_ is
+  // populated at codegen time, so this is safe even if setup() never ran.
+  // Returns false if a required direction write failed to verify.
+  bool configure_hardware();
 
   // Declared at codegen time, before setup(). pin in [0,15].
   void set_pin_input(uint8_t pin) { this->input_mask_ |= (uint16_t(1) << pin); }
@@ -73,13 +77,6 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
 
   // Optional: read INTF to learn which pins caused the interrupt (A = low byte).
   bool read_intf(uint16_t *out);
-
-  // Read INTCAP (value captured at the moment of the last interrupt; A = low
-  // byte). Reading INTCAP clears the interrupt condition just like reading GPIO.
-  bool read_intcap(uint16_t *out);
-
-  // TEMP DIAGNOSTIC: read back a single config register for verification.
-  bool diag_read_reg(uint8_t reg, uint8_t *value) { return this->read_reg_(reg, value); }
 
   // Write a single output pin. No-op semantics are left to the caller; this
   // writes OLAT and caches it so we never read-modify-write over I2C per toggle.
