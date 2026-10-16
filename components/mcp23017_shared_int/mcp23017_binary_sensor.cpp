@@ -22,6 +22,10 @@ void MCP23017BinarySensor::on_pin_state(bool level) {
         action.light->turn_off().perform();
       }
     }
+    // Generic press-edge callbacks (e.g. ha_light_hub dimmer hooks). Fired AFTER
+    // the light_actions_ loop, still on the OFF->ON edge, un-debounced.
+    for (auto &cb : this->on_press_)
+      cb();
   }
   this->last_logical_ = logical;
 }

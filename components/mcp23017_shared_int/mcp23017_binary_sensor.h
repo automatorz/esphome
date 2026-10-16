@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "esphome/core/component.h"
@@ -46,6 +47,17 @@ class MCP23017BinarySensor : public binary_sensor::BinarySensor,
     this->light_actions_.push_back(LightAction{light, false});
   }
 
+  // Generic press callback. Fired on the OFF->ON (press) edge, AFTER the
+  // light_actions_ loop. Kept SEPARATE from the light-specific light_actions_
+  // mechanism so other consumers (e.g. ha_light_hub) can hook the press edge
+  // without disturbing the button->light wiring. Un-debounced here on purpose:
+  // the raw edge stays generic; debounce lives in the consumer. The dependency
+  // stays one-directional (consumer -> this sensor), so this header never
+  // includes or forward-declares the consumer type.
+  void add_on_press(std::function<void()> &&cb) {
+    this->on_press_.push_back(std::move(cb));
+  }
+
   void setup() override {
     // Nothing to do here: the chip input mask and the coordinator listener
     // registration are both wired at CODEGEN time in __init__.py::_gen_input_pin,
@@ -75,6 +87,8 @@ class MCP23017BinarySensor : public binary_sensor::BinarySensor,
     bool turns_on;
   };
   std::vector<LightAction> light_actions_;
+  // Generic press-edge callbacks (see add_on_press). Separate from light_actions_.
+  std::vector<std::function<void()>> on_press_;
   // Previous logical (post-inversion) state, used to detect the press edge.
   bool last_logical_{false};
 };

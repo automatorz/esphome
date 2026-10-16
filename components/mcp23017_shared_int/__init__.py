@@ -109,6 +109,7 @@ CONF_ROLE = "role"
 CONF_ON_BUTTONS = "on_buttons"
 CONF_OFF_BUTTONS = "off_buttons"
 CONF_SHUTTER_HUB = "shutter_hub"
+CONF_HA_LIGHT_HUB = "ha_light_hub"
 
 DIR_INPUT = "input"
 DIR_OUTPUT = "output"
@@ -280,6 +281,15 @@ def _shutter_hub_schema(value):
     return NESTED_CONFIG_SCHEMA(value)
 
 
+def _ha_light_hub_schema(value):
+    # Lazily reference the sibling component's nested schema (mirrors
+    # _shutter_hub_schema) so the import only happens when a ha_light_hub: block
+    # is actually present.
+    from esphome.components.ha_light_hub import NESTED_CONFIG_SCHEMA
+
+    return NESTED_CONFIG_SCHEMA(value)
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -295,6 +305,10 @@ CONFIG_SCHEMA = cv.All(
             # nested schema (up_relay/down_relay are plain `sw...` name strings
             # resolved against this component's generated switches in codegen).
             cv.Optional(CONF_SHUTTER_HUB): _shutter_hub_schema,
+            # Optional embedded ha_light_hub. Uses the ha_light_hub component's
+            # nested schema (up_buttons/down_buttons are plain input id strings
+            # resolved against this component's generated input sensors in codegen).
+            cv.Optional(CONF_HA_LIGHT_HUB): _ha_light_hub_schema,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     _validate_at_least_one,
@@ -783,4 +797,32 @@ async def to_code(config):
 
         await build_shutter_hub(
             config[CONF_SHUTTER_HUB], relay_resolver=_resolve_relay
+        )
+
+    # Embedded ha_light_hub (optional). sensor_map is fully populated by the
+    # board loop above, so up_buttons/down_buttons references resolve cleanly.
+    # Order relative to the shutter_hub block is independent.
+    if CONF_HA_LIGHT_HUB in config:
+        # The dimmer calls HA services through the api; api: is not otherwise
+        # guarded (we reference api::global_api_server directly in C++).
+        if "api" not in CORE.config:
+            raise cv.Invalid("ha_light_hub requires an `api:` block in the configuration.")
+        # Source-copy sentinel: ha_light_hub is not a top-level section, so make
+        # the writer copy its C++ sources without running its own schema/to_code.
+        if "ha_light_hub" not in CORE.config:
+            CORE.config["ha_light_hub"] = []
+        CORE.loaded_integrations.add("ha_light_hub")
+
+        from esphome.components.ha_light_hub import build_ha_light_hub
+
+        async def _resolve_button(ref):
+            if ref not in sensor_map:
+                raise cv.Invalid(
+                    f"ha_light_hub button '{ref}' does not match any generated "
+                    f"input sensor (expected 'has_board<bb>_chip<cc>_pin<pp>')."
+                )
+            return sensor_map[ref]
+
+        await build_ha_light_hub(
+            config[CONF_HA_LIGHT_HUB], button_resolver=_resolve_button
         )
