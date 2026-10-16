@@ -6,6 +6,10 @@ namespace mcp23017_shared_int {
 
 static const char *const TAG = "mcp23017_shared_int.coord";
 
+// TEMP diagnostic state for the bounded INT-WATCH window. File-scope so the
+// probe is self-contained in this .cpp (no .h dependency). Removed with probe.
+static bool g_int_watch_saw_low = false;
+
 void SharedIntCoordinator::setup() {
   ESP_LOGCONFIG(TAG, "Setting up shared-interrupt coordinator ...");
 
@@ -58,14 +62,17 @@ void SharedIntCoordinator::setup() {
   // wall switches during this 30 s window; if the line ever dips to 0 we will see
   // it, and the ISR count will climb. If it stays 1 the whole time, the interrupt
   // signal is not getting through the isolator (a hardware wiring issue).
+  // State is a file-scope static (not a class member) so this diagnostic is
+  // fully self-contained in the .cpp and does not depend on any .h change
+  // (avoids header/source desync when the build tree copies files inconsistently).
   this->set_timeout("mcp_int_watch_start", 12000, [this]() {
     ESP_LOGW(TAG, "INT-WATCH: starting 30s GPIO14 watch now - PRESS WALL SWITCHES");
     this->set_interval("mcp_int_watch", 20, [this]() {
       if (this->interrupt_pin_ == nullptr)
         return;
-      if (this->interrupt_pin_->digital_read() == false) {
-        this->int_watch_saw_low_ = true;
-        ESP_LOGW(TAG, "INT-WATCH: GPIO14 went LOW! isr_count=%u", (unsigned) this->isr_watch_count_);
+      if (this->interrupt_pin_->digital_read() == false && !g_int_watch_saw_low) {
+        g_int_watch_saw_low = true;
+        ESP_LOGW(TAG, "INT-WATCH: GPIO14 went LOW!");
       }
     });
     this->set_timeout("mcp_int_watch_stop", 30000, [this]() {
@@ -73,7 +80,7 @@ void SharedIntCoordinator::setup() {
       ESP_LOGW(TAG,
                "INT-WATCH: done. GPIO14 ever LOW during window = %s. If NO, the "
                "chip INT is not reaching the ESP through the isolator (hardware).",
-               this->int_watch_saw_low_ ? "YES" : "NO");
+               g_int_watch_saw_low ? "YES" : "NO");
     });
   });
 }
