@@ -18,10 +18,15 @@ class MCP23017Output : public output::BinaryOutput, public Component {
 
   void setup() override {
     // Mark the pin as an output on the chip so it is excluded from the input
-    // mask / interrupt handling. Drive it low initially; the light component
-    // applies its own restore mode on top.
+    // mask / interrupt handling. Drive it to its OFF level initially so the
+    // light does not flash on at boot. For an inverted output, off = hardware
+    // HIGH, so we must write the raw level = inverted_ (NOT a hard-coded false,
+    // which for an inverted light is hardware-low = ON and caused a visible
+    // ~1-2 s flash before the light component's restore wrote the real state).
+    // This matches the chip's OLAT pre-load in configure_hardware(), so there
+    // is no glitch. The light component applies its own restore mode on top.
     this->chip_->set_pin_output(this->pin_);
-    this->chip_->write_output(this->pin_, false);
+    this->chip_->write_output(this->pin_, this->inverted_);
   }
 
   void dump_config() override;
