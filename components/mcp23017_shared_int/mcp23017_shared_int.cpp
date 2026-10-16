@@ -6,6 +6,27 @@ namespace mcp23017_shared_int {
 
 static const char *const TAG = "mcp23017_shared_int.hub";
 
+// Write a register and read it back; retry a few times on mismatch. Returns
+// true if the readback matches. Logs each failed attempt so we learn which
+// writes are flaky at boot. This hardens setup against transient I2C issues
+// that were silently leaving GPINTEN/IOCON unset on some chips.
+bool MCP23017Chip::write_verify_(uint8_t reg, uint8_t value) {
+  for (int attempt = 1; attempt <= 5; attempt++) {
+    this->write_reg_(reg, value);
+    uint8_t readback = 0;
+    if (this->read_reg_(reg, &readback) && readback == value)
+      return true;
+    ESP_LOGW(TAG,
+             "0x%02X reg 0x%02X write/verify attempt %d failed (wrote 0x%02X, "
+             "read 0x%02X); retrying",
+             this->address_, reg, attempt, value, readback);
+    delay(2);
+  }
+  ESP_LOGE(TAG, "0x%02X reg 0x%02X failed to verify after retries", this->address_,
+           reg);
+  return false;
+}
+
 void MCP23017Chip::setup() {
   ESP_LOGCONFIG(TAG, "Setting up MCP23017 at 0x%02X ...", this->address_);
 
@@ -13,33 +34,36 @@ void MCP23017Chip::setup() {
   const uint8_t idir_a = uint8_t(input_mask & 0xFF);         // 1 = input
   const uint8_t idir_b = uint8_t((input_mask >> 8) & 0xFF);
 
+  // --- IOCON FIRST: MIRROR + ODR, and BANK=0 (bit7=0) / SEQOP as default.
+  //     Program IOCON before the rest so the register map/bank is known-good
+  //     and the INT output mode is set before interrupts are enabled. Both
+  //     IOCON addresses alias the same register in BANK=0; write both. ---
+  const uint8_t iocon = IOCON_MIRROR | IOCON_ODR;
+  this->write_verify_(REG_IOCONA, iocon);
+  this->write_verify_(REG_IOCONB, iocon);
+
   // --- Direction: IODIR bit 1 = input, 0 = output ---
-  if (!this->write_reg_(REG_IODIRA, idir_a) || !this->write_reg_(REG_IODIRB, idir_b)) {
+  if (!this->write_verify_(REG_IODIRA, idir_a) ||
+      !this->write_verify_(REG_IODIRB, idir_b)) {
     this->mark_failed();
     return;
   }
 
   // --- Pull-ups: external pull-ups per design, so GPPU = 0 on all pins. ---
-  this->write_reg_(REG_GPPUA, 0x00);
-  this->write_reg_(REG_GPPUB, 0x00);
+  this->write_verify_(REG_GPPUA, 0x00);
+  this->write_verify_(REG_GPPUB, 0x00);
 
   // --- Input polarity handled in software (sensors), so IPOL = 0. ---
-  this->write_reg_(REG_IPOLA, 0x00);
-  this->write_reg_(REG_IPOLB, 0x00);
+  this->write_verify_(REG_IPOLA, 0x00);
+  this->write_verify_(REG_IPOLB, 0x00);
 
   // --- Interrupt-on-change: INTCON = 0 (compare against previous value). ---
-  this->write_reg_(REG_INTCONA, 0x00);
-  this->write_reg_(REG_INTCONB, 0x00);
+  this->write_verify_(REG_INTCONA, 0x00);
+  this->write_verify_(REG_INTCONB, 0x00);
 
   // --- Enable interrupts on INPUT pins only; outputs never assert INT. ---
-  this->write_reg_(REG_GPINTENA, idir_a);
-  this->write_reg_(REG_GPINTENB, idir_b);
-
-  // --- IOCON: MIRROR (either INTA/INTB fires for any port) + ODR (open-drain,
-  //     required for the wired-OR shared INT line). ---
-  const uint8_t iocon = IOCON_MIRROR | IOCON_ODR;
-  this->write_reg_(REG_IOCONA, iocon);
-  this->write_reg_(REG_IOCONB, iocon);
+  this->write_verify_(REG_GPINTENA, idir_a);
+  this->write_verify_(REG_GPINTENB, idir_b);
 
   // --- Seed cached OLAT from hardware so the first write is coherent. ---
   this->read_reg_(REG_OLATA, &this->olat_a_);

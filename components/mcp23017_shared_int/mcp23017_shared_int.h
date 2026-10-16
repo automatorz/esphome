@@ -85,6 +85,8 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
  protected:
   bool read_reg_(uint8_t reg, uint8_t *value);
   bool write_reg_(uint8_t reg, uint8_t value);
+  // Write-then-readback with retry; hardens setup against transient I2C fails.
+  bool write_verify_(uint8_t reg, uint8_t value);
   bool read_u16_(uint8_t reg_a, uint16_t *out);
 
   // Bit = 1 means the pin is an INPUT. Outputs are the complement.
