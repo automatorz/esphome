@@ -50,11 +50,12 @@ class SharedIntCoordinator : public Component {
   // diag_poll_() probe once the interrupt path is confirmed working.
   volatile uint32_t isr_count_{0};
 
-  // TEMP DIAGNOSTIC: polled probe (1 Hz, independent of the ISR). Logs the raw
-  // INT pin level, the ISR fire count, and each chip's raw port read, so we can
-  // tell apart "MCP doesn't see the press", "INT doesn't reach the ESP", and a
-  // firmware problem. Remove once inputs work.
+  // TEMP DIAGNOSTIC: polled probe (1 Hz, independent of the ISR). Reads INTF
+  // only (never clears the latch) and accumulates a sticky per-chip mask of
+  // every interrupt flag seen since boot, so a press at any time stays visible
+  // regardless of poll timing. Remove once inputs work.
   void diag_poll_();
+  std::vector<uint16_t> diag_intf_seen_;
 
   // Read all chips once and dispatch to listeners. Returns true if any chip read
   // failed (so we can decide whether to keep retrying).

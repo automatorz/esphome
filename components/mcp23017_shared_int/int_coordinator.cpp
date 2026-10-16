@@ -37,9 +37,11 @@ void SharedIntCoordinator::setup() {
   this->force_initial_publish_ = true;
   this->enable_loop();
 
-  // TEMP DIAGNOSTIC: poll once a second, independent of the interrupt path, so a
-  // dead INT line still produces data. Remove this (and diag_poll_ / isr_count_)
-  // once wall-switch inputs are confirmed working.
+  // TEMP DIAGNOSTIC: poll independent of the interrupt path. We DO NOT clear the
+  // chip latch here (no GPIO/INTCAP read), so any momentary press that latches
+  // INTF stays latched and accumulates in diag_intf_seen_ until you power-cycle.
+  // Press buttons whenever; the sticky mask makes timing irrelevant.
+  this->diag_intf_seen_.assign(this->chips_.size(), 0);
   this->set_interval("mcp_diag", 1000, [this]() { this->diag_poll_(); });
 }
 
@@ -49,32 +51,28 @@ void SharedIntCoordinator::diag_poll_() {
                         : -1;
   ESP_LOGD(TAG, "DIAG: INT pin level=%d  isr_count=%u  chips=%u", level,
            (unsigned) this->isr_count_, (unsigned) this->chips_.size());
+  if (this->diag_intf_seen_.size() < this->chips_.size())
+    this->diag_intf_seen_.resize(this->chips_.size(), 0);
   size_t idx = 0;
   for (auto *chip : this->chips_) {
     const uint16_t mask = chip->get_input_mask();
-    // Read INTF FIRST (non-clearing): tells us which input pins have a pending
-    // interrupt flag latched since the last clear. A momentary press that
-    // happened between polls will show here even though the pin is back to idle.
+    // Read INTF ONLY (non-clearing). We deliberately do NOT read GPIO or INTCAP
+    // on the diagnostic path, so the chip's latch is never cleared by us. Any
+    // press that ever latches stays latched and accumulates in the sticky mask.
     uint16_t intf = 0;
     const bool ok_intf = chip->read_intf(&intf);
-    // Then read INTCAP: the value captured at the moment of the interrupt.
-    // Reading INTCAP clears the interrupt condition (like reading GPIO).
-    uint16_t intcap = 0;
-    const bool ok_cap = chip->read_intcap(&intcap);
-    // Live GPIO for reference.
-    uint16_t port = 0;
-    const bool ok_gpio = chip->read_inputs(&port);
+    this->diag_intf_seen_[idx] |= intf;
     ESP_LOGD(TAG,
-             "DIAG: chip[%u] 0x%02X intf_ok=%s INTF=0x%04X intcap_ok=%s "
-             "INTCAP=0x%04X gpio_ok=%s GPIO=0x%04X inputs=0x%04X",
+             "DIAG: chip[%u] 0x%02X intf_ok=%s INTF=0x%04X  intf_seen=0x%04X",
              (unsigned) idx, chip->get_i2c_address(), ok_intf ? "y" : "N", intf,
-             ok_cap ? "y" : "N", intcap, ok_gpio ? "y" : "N", port,
-             (uint16_t) (port & mask));
-    if (intf != 0)
-      ESP_LOGW(TAG, "DIAG: chip[%u] 0x%02X LATCHED a change! INTF=0x%04X -> this "
-                    "chip IS detecting presses (interrupt simply isn't reaching "
-                    "the ESP).",
-               (unsigned) idx, chip->get_i2c_address(), intf);
+             this->diag_intf_seen_[idx]);
+    if (this->diag_intf_seen_[idx] != 0)
+      ESP_LOGW(TAG,
+               "DIAG: chip[%u] 0x%02X HAS LATCHED a change since boot "
+               "(intf_seen=0x%04X) -> this chip IS detecting presses; the "
+               "interrupt just isn't reaching the ESP.",
+               (unsigned) idx, chip->get_i2c_address(),
+               this->diag_intf_seen_[idx]);
     idx++;
   }
 }
