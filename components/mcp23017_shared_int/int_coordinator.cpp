@@ -6,10 +6,6 @@ namespace mcp23017_shared_int {
 
 static const char *const TAG = "mcp23017_shared_int.coord";
 
-// TEMP diagnostic state for the bounded INT-WATCH window. File-scope so the
-// probe is self-contained in this .cpp (no .h dependency). Removed with probe.
-static bool g_int_watch_saw_low = false;
-
 void SharedIntCoordinator::setup() {
   ESP_LOGCONFIG(TAG, "Setting up shared-interrupt coordinator ...");
 
@@ -53,35 +49,25 @@ void SharedIntCoordinator::setup() {
   this->force_initial_publish_ = true;
   this->enable_loop();
 
-  // TEMP: bounded GPIO14 watcher (self-terminating; NOT steady-state polling and
-  // NO I2C). Starting 12 s after boot, sample ONLY the ESP's own interrupt GPIO
-  // pin every 20 ms for 30 s, then STOP permanently. We never touch the I2C bus
-  // here, so there is zero i2c_master risk. Purpose: with all 8 chips confirmed
-  // configured (GPINTEN=0xFF, IOCON=0x44), the only remaining question is whether
-  // the chip INT assertion actually reaches GPIO14 through the ISO7221. Press
-  // wall switches during this 30 s window; if the line ever dips to 0 we will see
-  // it, and the ISR count will climb. If it stays 1 the whole time, the interrupt
-  // signal is not getting through the isolator (a hardware wiring issue).
-  // State is a file-scope static (not a class member) so this diagnostic is
-  // fully self-contained in the .cpp and does not depend on any .h change
-  // (avoids header/source desync when the build tree copies files inconsistently).
-  this->set_timeout("mcp_int_watch_start", 12000, [this]() {
-    ESP_LOGW(TAG, "INT-WATCH: starting 30s GPIO14 watch now - PRESS WALL SWITCHES");
-    this->set_interval("mcp_int_watch", 20, [this]() {
-      if (this->interrupt_pin_ == nullptr)
-        return;
-      if (this->interrupt_pin_->digital_read() == false && !g_int_watch_saw_low) {
-        g_int_watch_saw_low = true;
-        ESP_LOGW(TAG, "INT-WATCH: GPIO14 went LOW!");
-      }
-    });
-    this->set_timeout("mcp_int_watch_stop", 30000, [this]() {
-      this->cancel_interval("mcp_int_watch");
+  // TEMP ONE-SHOT idle probe (single fire; one I2C read burst, NOT steady-state
+  // polling). 10 s after boot, with NOTHING pressed, read INTF + current input
+  // level for every chip once. INT is stuck low at idle, so this shows WHICH
+  // chip(s) and pins are asserting the interrupt at idle - almost certainly
+  // unconnected/floating input pins that have interrupt-on-change enabled.
+  this->set_timeout("mcp_idle_intf", 10000, [this]() {
+    const int level =
+        (this->interrupt_pin_ != nullptr) ? (this->interrupt_pin_->digital_read() ? 1 : 0) : -1;
+    ESP_LOGW(TAG, "IDLE-INTF: INT pin level=%d (nothing should be pressed)", level);
+    for (auto *chip : this->chips_) {
+      uint16_t intf = 0, gpio = 0;
+      const bool ok_intf = chip->read_intf(&intf);
+      const bool ok_gpio = chip->read_inputs(&gpio);
       ESP_LOGW(TAG,
-               "INT-WATCH: done. GPIO14 ever LOW during window = %s. If NO, the "
-               "chip INT is not reaching the ESP through the isolator (hardware).",
-               g_int_watch_saw_low ? "YES" : "NO");
-    });
+               "IDLE-INTF: 0x%02X intf_ok=%s INTF=0x%04X gpio_ok=%s GPIO=0x%04X "
+               "input_mask=0x%04X",
+               chip->get_i2c_address(), ok_intf ? "y" : "N", intf, ok_gpio ? "y" : "N",
+               gpio, chip->get_input_mask());
+    }
   });
 }
 
