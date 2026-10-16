@@ -40,7 +40,21 @@ class SharedIntCoordinator : public Component {
   }
 
  protected:
-  static void IRAM_ATTR gpio_intr(SharedIntCoordinator *arg) { arg->enable_loop_soon_any_context(); }
+  static void IRAM_ATTR gpio_intr(SharedIntCoordinator *arg) {
+    arg->isr_count_++;
+    arg->enable_loop_soon_any_context();
+  }
+
+  // TEMP DIAGNOSTIC: counts ISR fires on the shared INT pin. volatile because it
+  // is written from the ISR and read from loop/interval context. Remove with the
+  // diag_poll_() probe once the interrupt path is confirmed working.
+  volatile uint32_t isr_count_{0};
+
+  // TEMP DIAGNOSTIC: polled probe (1 Hz, independent of the ISR). Logs the raw
+  // INT pin level, the ISR fire count, and each chip's raw port read, so we can
+  // tell apart "MCP doesn't see the press", "INT doesn't reach the ESP", and a
+  // firmware problem. Remove once inputs work.
+  void diag_poll_();
 
   // Read all chips once and dispatch to listeners. Returns true if any chip read
   // failed (so we can decide whether to keep retrying).

@@ -36,6 +36,31 @@ void SharedIntCoordinator::setup() {
   // so all listener setup() calls have completed first.
   this->force_initial_publish_ = true;
   this->enable_loop();
+
+  // TEMP DIAGNOSTIC: poll once a second, independent of the interrupt path, so a
+  // dead INT line still produces data. Remove this (and diag_poll_ / isr_count_)
+  // once wall-switch inputs are confirmed working.
+  this->set_interval("mcp_diag", 1000, [this]() { this->diag_poll_(); });
+}
+
+void SharedIntCoordinator::diag_poll_() {
+  const int level = (this->interrupt_pin_ != nullptr)
+                        ? (this->interrupt_pin_->digital_read() ? 1 : 0)
+                        : -1;
+  ESP_LOGD(TAG, "DIAG: INT pin level=%d  isr_count=%u  chips=%u", level,
+           (unsigned) this->isr_count_, (unsigned) this->chips_.size());
+  size_t idx = 0;
+  for (auto *chip : this->chips_) {
+    uint16_t port = 0;
+    const bool ok = chip->read_inputs(&port);
+    const uint16_t mask = chip->get_input_mask();
+    ESP_LOGD(TAG,
+             "DIAG: chip[%u] 0x%02X read_ok=%s port=0x%04X input_mask=0x%04X "
+             "inputs=0x%04X",
+             (unsigned) idx, chip->get_i2c_address(), ok ? "yes" : "NO", port,
+             mask, (uint16_t) (port & mask));
+    idx++;
+  }
 }
 
 void SharedIntCoordinator::loop() {
