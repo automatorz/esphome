@@ -27,7 +27,15 @@ bool MCP23017Chip::write_verify_(uint8_t reg, uint8_t value) {
   return false;
 }
 
+// TEMP DIAGNOSTIC: global counter of chip setup() calls, in call order.
+static int g_chip_setup_order = 0;
+
 void MCP23017Chip::setup() {
+  g_chip_setup_order++;
+  ESP_LOGW(TAG,
+           "DIAG-SETUP: MCP23017 0x%02X setup() CALLED (order #%d, "
+           "setup_priority=%.1f)",
+           this->address_, g_chip_setup_order, this->get_setup_priority());
   ESP_LOGCONFIG(TAG, "Setting up MCP23017 at 0x%02X ...", this->address_);
 
   const uint16_t input_mask = this->input_mask_;

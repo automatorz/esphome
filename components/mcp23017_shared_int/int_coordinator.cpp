@@ -7,6 +7,10 @@ namespace mcp23017_shared_int {
 static const char *const TAG = "mcp23017_shared_int.coord";
 
 void SharedIntCoordinator::setup() {
+  ESP_LOGW(TAG,
+           "DIAG-SETUP: coordinator setup() CALLED (setup_priority=%.1f). "
+           "Chips registered so far: %u",
+           this->get_setup_priority(), (unsigned) this->chips_.size());
   ESP_LOGCONFIG(TAG, "Setting up shared-interrupt coordinator ...");
 
   // NOTE on ordering: listeners (binary sensors) register themselves from their
