@@ -19,8 +19,17 @@ class MCP23017Switch : public switch_::Switch, public Component {
     // mask / interrupt handling, then apply the restore-mode initial state.
     this->chip_->set_pin_output(this->pin_);
     auto initial = this->get_initial_state_with_restore_mode();
-    if (initial.has_value())
-      this->write_state(initial.value());
+    if (initial.has_value()) {
+      // get_initial_state_with_restore_mode() returns the LOGICAL state. Our
+      // write_state() expects the already-inverted HARDWARE level (per the
+      // switch base contract: "Inversion is already applied"). turn_on/off and
+      // control() apply inversion, but we call write_state() directly here, so
+      // we must apply it ourselves: hardware = logical XOR inverted. Previously
+      // we passed the logical value raw, so an inverted relay with
+      // RESTORE_DEFAULT_OFF got write_state(false) -> hardware low -> relay ON
+      // at boot (every shutter relay energized). XOR fixes that.
+      this->write_state(initial.value() != this->is_inverted());
+    }
   }
 
   void dump_config() override;
