@@ -35,11 +35,11 @@ A board expands into:
                          name ``<prefix> Board<bb> <location> (Chip<cc> Pin<pp>)``
 """
 
-from esphome import pins
+from esphome import automation, pins
 import esphome.codegen as cg
-from esphome.components import binary_sensor, i2c, light, output, switch
+from esphome.components import binary_sensor, i2c, light, output, sun, switch
 import esphome.config_validation as cv
-from esphome.core import CORE, ID
+from esphome.core import CORE, ID, Lambda
 from esphome.const import (
     CONF_ADDRESS,
     CONF_DIRECTION,
@@ -91,6 +91,10 @@ MCP23017Switch = mcp23017_shared_int_ns.class_(
 MCP23017Output = mcp23017_shared_int_ns.class_(
     "MCP23017Output", output.BinaryOutput, cg.Component
 )
+# Plain (NON-Component) helper driven by two native sun::SunTriggers. It is a
+# cg.new_Pvariable object, NOT registered as a component and NOT counted toward
+# ESPHOME_COMPONENT_COUNT.
+SunScheduleHandler = mcp23017_shared_int_ns.class_("SunScheduleHandler")
 
 # --- config keys ---
 CONF_CHIPS = "chips"
@@ -110,6 +114,16 @@ CONF_ON_BUTTONS = "on_buttons"
 CONF_OFF_BUTTONS = "off_buttons"
 CONF_SHUTTER_HUB = "shutter_hub"
 CONF_HA_LIGHT_HUB = "ha_light_hub"
+CONF_SUN_SCHEDULE = "sun_schedule"
+CONF_ELEVATION = "elevation"
+CONF_TRIGGER_SHUTTER_HUB = "trigger_shutter_hub"
+CONF_SUNSET_ACTION = "sunset_action"
+CONF_SUNRISE_ACTION = "sunrise_action"
+CONF_SUN_ID = "sun_id"
+
+# Action values accepted by sunset_action / sunrise_action (binary on/off only).
+SUN_ACTION_TURN_ON = "turn_on"
+SUN_ACTION_TURN_OFF = "turn_off"
 
 DIR_INPUT = "input"
 DIR_OUTPUT = "output"
@@ -154,6 +168,14 @@ _PIN_SCHEMA = cv.Schema(
         cv.Optional(CONF_INVERTED): cv.boolean,
         cv.Optional(CONF_ON_BUTTONS): cv.ensure_list(cv.string),
         cv.Optional(CONF_OFF_BUTTONS): cv.ensure_list(cv.string),
+        # Optional, independent per-light sun actions. Binary on/off only. A
+        # light with neither key is unaffected by sun_schedule.
+        cv.Optional(CONF_SUNSET_ACTION): cv.one_of(
+            SUN_ACTION_TURN_ON, SUN_ACTION_TURN_OFF, lower=True
+        ),
+        cv.Optional(CONF_SUNRISE_ACTION): cv.one_of(
+            SUN_ACTION_TURN_ON, SUN_ACTION_TURN_OFF, lower=True
+        ),
     }
 )
 
@@ -167,7 +189,12 @@ def _validate_pin(value):
         if CONF_NAME not in value:
             raise cv.Invalid("A 'light' pin requires an explicit 'name'.")
     else:
-        for key in (CONF_ON_BUTTONS, CONF_OFF_BUTTONS):
+        for key in (
+            CONF_ON_BUTTONS,
+            CONF_OFF_BUTTONS,
+            CONF_SUNSET_ACTION,
+            CONF_SUNRISE_ACTION,
+        ):
             if key in value:
                 raise cv.Invalid(f"'{key}' is only valid for 'light' pins.")
     return value
@@ -290,6 +317,17 @@ def _ha_light_hub_schema(value):
     return NESTED_CONFIG_SCHEMA(value)
 
 
+# Nested sun_schedule sub-schema. ONE shared elevation drives BOTH sunrise and
+# sunset triggers. sun_id auto-resolves the single existing `sun:` component.
+SUN_SCHEDULE_SCHEMA = cv.Schema(
+    {
+        cv.GenerateID(CONF_SUN_ID): cv.use_id(sun.Sun),
+        cv.Optional(CONF_ELEVATION, default=0.0): cv.float_,
+        cv.Optional(CONF_TRIGGER_SHUTTER_HUB, default=True): cv.boolean,
+    }
+)
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -309,6 +347,9 @@ CONFIG_SCHEMA = cv.All(
             # nested schema (up_buttons/down_buttons are plain input id strings
             # resolved against this component's generated input sensors in codegen).
             cv.Optional(CONF_HA_LIGHT_HUB): _ha_light_hub_schema,
+            # Optional sun schedule: turn component lights on/off and (optionally)
+            # fire the embedded shutter_hub schedule_* at ONE shared elevation.
+            cv.Optional(CONF_SUN_SCHEDULE): SUN_SCHEDULE_SCHEMA,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     _validate_at_least_one,
@@ -507,9 +548,22 @@ def _collect_button_links(pin_conf, button_links):
             button_links.append((light_id, light_name, button_id, is_on))
 
 
+def _collect_sun_specs(pin_conf, sun_light_specs):
+    """Append a (light_id, sunset_action, sunrise_action) row for a light pin
+    that has at least one sun action. Each action is 'turn_on'/'turn_off' or
+    None (key absent). Resolution to the light var happens after the board loop
+    via light_map, mirroring button-link resolution."""
+    sunset = pin_conf.get(CONF_SUNSET_ACTION)
+    sunrise = pin_conf.get(CONF_SUNRISE_ACTION)
+    if sunset is None and sunrise is None:
+        return
+    sun_light_specs.append((pin_conf[CONF_ID], sunset, sunrise))
+
+
 async def _gen_bank(
     coord, chip, board_id, chip_id, chip_index, bank_conf, is_bank_a,
     switch_map=None, sensor_map=None, light_map=None, button_links=None,
+    sun_light_specs=None,
 ):
     direction = bank_conf[CONF_DIRECTION]
     bank_inverted = bank_conf[CONF_INVERTED]
@@ -538,6 +592,9 @@ async def _gen_bank(
                 # Collect the button->light intent now; resolve after the loop.
                 if button_links is not None:
                     _collect_button_links(pin_conf, button_links)
+                # Collect per-light sun actions; resolve after the loop too.
+                if sun_light_specs is not None:
+                    _collect_sun_specs(pin_conf, sun_light_specs)
             else:
                 await _gen_switch_pin(
                     chip, board_id, chip_id, pin, prefix, location, bank_inverted,
@@ -547,7 +604,7 @@ async def _gen_bank(
 
 async def _gen_board(
     coord, board_conf, switch_map=None, sensor_map=None, light_map=None,
-    button_links=None,
+    button_links=None, sun_light_specs=None,
 ):
     board_id = board_conf[CONF_BOARD_ID]
     addresses = [board_conf[CONF_CHIP1_ADDRESS], board_conf[CONF_CHIP2_ADDRESS]]
@@ -569,12 +626,12 @@ async def _gen_board(
         await _gen_bank(
             coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_A], True,
             switch_map=switch_map, sensor_map=sensor_map, light_map=light_map,
-            button_links=button_links,
+            button_links=button_links, sun_light_specs=sun_light_specs,
         )
         await _gen_bank(
             coord, chip, board_id, chip_id, chip_index, board_conf[CONF_BANK_B], False,
             switch_map=switch_map, sensor_map=sensor_map, light_map=light_map,
-            button_links=button_links,
+            button_links=button_links, sun_light_specs=sun_light_specs,
         )
 
 
@@ -694,6 +751,25 @@ def _fabricated_shutter_hub_ids(config):
             yield sanitize(snake_case(f"{base_name}_position"))
 
 
+# Deterministic ids for the two SunTriggers synthesized by the sun_schedule
+# path. These are the ONLY Component-derived objects added by sun_schedule, so
+# ONLY these two must be counted toward ESPHOME_COMPONENT_COUNT. The handler
+# object, the two Automations and the two lambda actions are NOT Components and
+# are NOT yielded here (counting them would over-count the fixed array).
+_SUN_TRIGGER_SUNSET_ID = "mcp_sun_trigger_sunset"
+_SUN_TRIGGER_SUNRISE_ID = "mcp_sun_trigger_sunrise"
+
+
+def _fabricated_sun_schedule_ids(config):
+    """Yield the Component ids fabricated by the sun_schedule path (exactly the
+    two sun::SunTriggers) so they are counted before ESPHOME_COMPONENT_COUNT is
+    frozen. Nothing else on this path is a Component."""
+    if CONF_SUN_SCHEDULE not in config:
+        return
+    yield _SUN_TRIGGER_SUNSET_ID
+    yield _SUN_TRIGGER_SUNRISE_ID
+
+
 def _final_validate(config):
     # Declare every component ID this integration (and its embedded shutter_hub)
     # fabricates at codegen, so CORE.component_ids reflects them before the core
@@ -701,6 +777,8 @@ def _final_validate(config):
     for obj_id in _fabricated_component_ids(config):
         CORE.component_ids.add(obj_id)
     for obj_id in _fabricated_shutter_hub_ids(config):
+        CORE.component_ids.add(obj_id)
+    for obj_id in _fabricated_sun_schedule_ids(config):
         CORE.component_ids.add(obj_id)
     return config
 
@@ -746,10 +824,14 @@ async def to_code(config):
     sensor_map = {}
     light_map = {}
     button_links = []
+    #   sun_light_specs : (light_id, sunset_action, sunrise_action) rows gathered
+    #                     from each light pin's sunset_action/sunrise_action.
+    sun_light_specs = []
     for board_conf in config.get(CONF_BOARDS, []):
         await _gen_board(
             coord, board_conf, switch_map=switch_map, sensor_map=sensor_map,
             light_map=light_map, button_links=button_links,
+            sun_light_specs=sun_light_specs,
         )
 
     # Wire each light's on_buttons/off_buttons now that all input sensors and
@@ -772,7 +854,9 @@ async def to_code(config):
             cg.add(sensor_var.set_light_off(light_var))
 
     # Embedded shutter_hub (optional). Boards are already expanded above, so the
-    # switch_map is fully populated before we wire the shutters.
+    # switch_map is fully populated before we wire the shutters. Capture the hub
+    # var so the sun_schedule path (below) can fire its schedule_* methods.
+    shutter_hub_var = None
     if CONF_SHUTTER_HUB in config:
         # Ensure shutter_hub's C++ sources get copied into the build. Its
         # entities are generated by build_shutter_hub below (not by a top-level
@@ -795,7 +879,7 @@ async def to_code(config):
                 )
             return switch_map[ref]
 
-        await build_shutter_hub(
+        shutter_hub_var = await build_shutter_hub(
             config[CONF_SHUTTER_HUB], relay_resolver=_resolve_relay
         )
 
@@ -826,3 +910,93 @@ async def to_code(config):
         await build_ha_light_hub(
             config[CONF_HA_LIGHT_HUB], button_resolver=_resolve_button
         )
+
+    # Sun schedule (optional). Turns this component's own light entities on/off
+    # at sunrise/sunset and (optionally) fires the embedded shutter_hub's
+    # schedule_* methods at ONE shared elevation. Must run after the board loop
+    # (light vars resolved) and after the shutter_hub block (hub var captured).
+    if CONF_SUN_SCHEDULE in config:
+        sun_cfg = config[CONF_SUN_SCHEDULE]
+        try:
+            sun_var = await cg.get_variable(sun_cfg[CONF_SUN_ID])
+        except Exception as err:  # pragma: no cover - friendly fallback
+            raise cv.Invalid(
+                "sun_schedule requires a 'sun:' component in the configuration."
+            ) from err
+
+        # The handler is a plain object (NOT a Component): no register_component,
+        # not counted toward ESPHOME_COMPONENT_COUNT.
+        handler_id = ID(
+            "mcp_sun_schedule", is_declaration=True, type=SunScheduleHandler
+        )
+        handler = cg.new_Pvariable(handler_id)
+
+        # Wire per-light sun actions, resolving each light id via light_map.
+        for light_id, sunset_action, sunrise_action in sun_light_specs:
+            light_var = light_map.get(light_id)
+            if light_var is None:
+                raise cv.Invalid(
+                    f"sun_schedule references light '{light_id}', but no light "
+                    f"with that id was generated by this component's boards."
+                )
+            if sunset_action is not None:
+                cg.add(
+                    handler.add_sunset_action(
+                        light_var, sunset_action == SUN_ACTION_TURN_ON
+                    )
+                )
+            if sunrise_action is not None:
+                cg.add(
+                    handler.add_sunrise_action(
+                        light_var, sunrise_action == SUN_ACTION_TURN_ON
+                    )
+                )
+
+        # Wire the shutter_hub only when requested AND a hub exists.
+        if sun_cfg[CONF_TRIGGER_SHUTTER_HUB] and shutter_hub_var is not None:
+            cg.add(handler.set_shutter_hub(shutter_hub_var))
+
+        # Build the two native SunTriggers + Automations + lambda actions. The
+        # SunTriggers are the ONLY Component-derived objects (counted via
+        # _fabricated_sun_schedule_ids). The automations and lambda actions get
+        # unique minted ids but are NOT counted.
+        elevation = sun_cfg[CONF_ELEVATION]
+        handler_name = str(handler)
+
+        for direction, trigger_obj_id, is_sunrise in (
+            ("sunset", _SUN_TRIGGER_SUNSET_ID, False),
+            ("sunrise", _SUN_TRIGGER_SUNRISE_ID, True),
+        ):
+            trigger_id = _declare_component_id(trigger_obj_id, sun.SunTrigger)
+            trigger = cg.new_Pvariable(trigger_id)
+            await cg.register_component(trigger, {})
+            await cg.register_parented(trigger, sun_var)
+            cg.add(trigger.set_sunrise(is_sunrise))
+            cg.add(trigger.set_elevation(elevation))
+
+            auto_id = ID(
+                f"mcp_sun_auto_{direction}",
+                is_declaration=True,
+                type=automation.Automation,
+            )
+            auto = cg.new_Pvariable(auto_id, cg.TemplateArguments(), trigger)
+
+            action_id = ID(
+                f"mcp_sun_lambda_{direction}",
+                is_declaration=True,
+                type=automation.StatelessLambdaAction,
+            )
+            method = "on_sunrise" if is_sunrise else "on_sunset"
+            # Build a no-capture lambda action calling the handler. Mirrors the
+            # generated StatelessLambdaAction<>([]() -> void { ... }) shape; the
+            # handler var is referenced by its file-scope global name.
+            lambda_ = await cg.process_lambda(
+                Lambda(f"{handler_name}->{method}();"), [], return_type=cg.void
+            )
+            action = automation.new_lambda_pvariable(
+                action_id,
+                lambda_,
+                automation.StatelessLambdaAction,
+                cg.TemplateArguments(),
+            )
+            cg.add(auto.add_actions([action]))

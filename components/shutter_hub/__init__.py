@@ -241,3 +241,7 @@ async def build_shutter_hub(config, relay_resolver=None):
         for sh in g[CONF_SHUTTERS]:
             cg.add(gv.add_shutter(await cg.get_variable(sh)))
         cg.add(var.add_group(gv))
+
+    # Expose the hub var so an embedding component (mcp23017_shared_int) can wire
+    # it into its sun_schedule handler. The standalone to_code ignores the return.
+    return var
