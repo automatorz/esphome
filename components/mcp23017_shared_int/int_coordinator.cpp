@@ -48,6 +48,27 @@ void SharedIntCoordinator::setup() {
   // so all listener setup() calls have completed first.
   this->force_initial_publish_ = true;
   this->enable_loop();
+
+  // TEMP ONE-SHOT diagnostic (NOT polling: single fire). 10 s after boot, by
+  // which time the API logger is connected, read back GPINTEN/IOCON/IODIR for
+  // every chip once and log it, plus the live INT pin level. Confirms whether
+  // configure_hardware() actually programmed all 8 chips. Fires exactly once.
+  this->set_timeout("mcp_cfg_check", 10000, [this]() {
+    const int level =
+        (this->interrupt_pin_ != nullptr) ? (this->interrupt_pin_->digital_read() ? 1 : 0) : -1;
+    ESP_LOGW(TAG, "CFG-CHECK: INT pin level=%d (one-shot)", level);
+    for (auto *chip : this->chips_) {
+      uint8_t iodir = 0xEE, gpinten = 0xEE, iocon = 0xEE, olat = 0xEE;
+      chip->diag_read_reg(0x00, &iodir);     // IODIRA
+      chip->diag_read_reg(0x04, &gpinten);   // GPINTENA
+      chip->diag_read_reg(0x0A, &iocon);     // IOCONA
+      chip->diag_read_reg(0x14, &olat);      // OLATA
+      ESP_LOGW(TAG,
+               "CFG-CHECK: 0x%02X IODIRA=0x%02X GPINTENA=0x%02X IOCONA=0x%02X "
+               "OLATA=0x%02X",
+               chip->diag_address(), iodir, gpinten, iocon, olat);
+    }
+  });
 }
 
 void SharedIntCoordinator::loop() {

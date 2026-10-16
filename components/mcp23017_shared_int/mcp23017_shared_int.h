@@ -75,6 +75,10 @@ class MCP23017Chip : public Component, public i2c::I2CDevice {
   // Returns true on success; `out` holds the 16-bit port value (A = low byte).
   bool read_inputs(uint16_t *out);
 
+  // TEMP one-shot diagnostic register read (not polling; called once).
+  bool diag_read_reg(uint8_t reg, uint8_t *value) { return this->read_reg_(reg, value); }
+  uint8_t diag_address() const { return this->address_; }
+
   // Optional: read INTF to learn which pins caused the interrupt (A = low byte).
   bool read_intf(uint16_t *out);
 
