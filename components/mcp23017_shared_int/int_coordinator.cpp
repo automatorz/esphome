@@ -49,25 +49,32 @@ void SharedIntCoordinator::setup() {
   this->force_initial_publish_ = true;
   this->enable_loop();
 
-  // TEMP ONE-SHOT diagnostic (NOT polling: single fire). 10 s after boot, by
-  // which time the API logger is connected, read back GPINTEN/IOCON/IODIR for
-  // every chip once and log it, plus the live INT pin level. Confirms whether
-  // configure_hardware() actually programmed all 8 chips. Fires exactly once.
-  this->set_timeout("mcp_cfg_check", 10000, [this]() {
-    const int level =
-        (this->interrupt_pin_ != nullptr) ? (this->interrupt_pin_->digital_read() ? 1 : 0) : -1;
-    ESP_LOGW(TAG, "CFG-CHECK: INT pin level=%d (one-shot)", level);
-    for (auto *chip : this->chips_) {
-      uint8_t iodir = 0xEE, gpinten = 0xEE, iocon = 0xEE, olat = 0xEE;
-      chip->diag_read_reg(0x00, &iodir);     // IODIRA
-      chip->diag_read_reg(0x04, &gpinten);   // GPINTENA
-      chip->diag_read_reg(0x0A, &iocon);     // IOCONA
-      chip->diag_read_reg(0x14, &olat);      // OLATA
+  // TEMP: bounded GPIO14 watcher (self-terminating; NOT steady-state polling and
+  // NO I2C). Starting 12 s after boot, sample ONLY the ESP's own interrupt GPIO
+  // pin every 20 ms for 30 s, then STOP permanently. We never touch the I2C bus
+  // here, so there is zero i2c_master risk. Purpose: with all 8 chips confirmed
+  // configured (GPINTEN=0xFF, IOCON=0x44), the only remaining question is whether
+  // the chip INT assertion actually reaches GPIO14 through the ISO7221. Press
+  // wall switches during this 30 s window; if the line ever dips to 0 we will see
+  // it, and the ISR count will climb. If it stays 1 the whole time, the interrupt
+  // signal is not getting through the isolator (a hardware wiring issue).
+  this->set_timeout("mcp_int_watch_start", 12000, [this]() {
+    ESP_LOGW(TAG, "INT-WATCH: starting 30s GPIO14 watch now - PRESS WALL SWITCHES");
+    this->set_interval("mcp_int_watch", 20, [this]() {
+      if (this->interrupt_pin_ == nullptr)
+        return;
+      if (this->interrupt_pin_->digital_read() == false) {
+        this->int_watch_saw_low_ = true;
+        ESP_LOGW(TAG, "INT-WATCH: GPIO14 went LOW! isr_count=%u", (unsigned) this->isr_watch_count_);
+      }
+    });
+    this->set_timeout("mcp_int_watch_stop", 30000, [this]() {
+      this->cancel_interval("mcp_int_watch");
       ESP_LOGW(TAG,
-               "CFG-CHECK: 0x%02X IODIRA=0x%02X GPINTENA=0x%02X IOCONA=0x%02X "
-               "OLATA=0x%02X",
-               chip->diag_address(), iodir, gpinten, iocon, olat);
-    }
+               "INT-WATCH: done. GPIO14 ever LOW during window = %s. If NO, the "
+               "chip INT is not reaching the ESP through the isolator (hardware).",
+               this->int_watch_saw_low_ ? "YES" : "NO");
+    });
   });
 }
 
