@@ -28,6 +28,16 @@ static constexpr uint32_t POSITIONS_PREF_HASH = 0x5A00F00D;
 void ShutterHub::setup() {
   ESP_LOGCONFIG(TAG, "Shutter hub ready: %u shutters, %u groups",
                 (unsigned) shutters_.size(), (unsigned) groups_.size());
+
+  // Re-evaluate sun-through whenever either sun sensor publishes a new value.
+  // This internalizes what used to be two YAML `sensor: platform: sun`
+  // `on_value: lambda: id(shutterhub).on_sun_update();` triggers, so the user
+  // no longer needs those lambdas. Event-driven off the sun sensor updates
+  // (no polling added). Guarded so a missing sensor is a no-op.
+  if (this->sun_az_ != nullptr)
+    this->sun_az_->add_on_state_callback([this](float) { this->on_sun_update(); });
+  if (this->sun_el_ != nullptr)
+    this->sun_el_->add_on_state_callback([this](float) { this->on_sun_update(); });
 }
 
 void ShutterHub::ensure_positions_loaded_() {
