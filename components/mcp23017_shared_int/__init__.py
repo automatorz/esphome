@@ -73,6 +73,10 @@ AUTO_LOAD = [
     "cover",
     "text_sensor",
     "sensor",
+    # Needed by the embedded shutter_hub's Open-All button entity. The button
+    # is fabricated at codegen with no top-level `button:` section, so AUTO_LOAD
+    # makes the domain available. Harmless when no shutter_hub block is present.
+    "button",
     # ha_light_hub is an embedded sibling with NO top-level CONFIG_SCHEMA/to_code
     # (only NESTED_CONFIG_SCHEMA + build_ha_light_hub, consumed from our codegen).
     # AUTO_LOADing it is safe (it injects no failing top-level section, unlike

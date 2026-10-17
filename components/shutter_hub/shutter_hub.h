@@ -41,6 +41,19 @@ class ShutterHub : public Component {
   void set_heating_needed(binary_sensor::BinarySensor *s) { heat_ = s; }
   void set_time(time::RealTimeClock *t) { time_ = t; }
 
+  // Feature 1: scheduled backup open. hour/minute is the local time-of-day at
+  // which groups that close at sunset but do NOT open at sunrise are opened as
+  // a backup, once per day. Unset (hour == 255) leaves the feature inert.
+  void set_backup_open_time(uint8_t hour, uint8_t minute) {
+    backup_open_hour_ = hour;
+    backup_open_minute_ = minute;
+  }
+
+  // Feature 2: open every currently-closed shutter across all groups, skipping
+  // groups closed by sun-through or already opened/cancelled today. Driven by
+  // the Open-All button entity.
+  void open_all_closed_no_override();
+
   void enqueue(Shutter *s, Dir d, bool from_wall_switch);
   void stop_active();
   void cancel_shutter(Shutter *s);
@@ -72,6 +85,7 @@ class ShutterHub : public Component {
   void finalize_active_(Shutter *finished);
   void refresh_active_position_();
   void ensure_positions_loaded_();
+  void maybe_backup_open_();
 
   HubState state_{HubState::IDLE};
   uint32_t state_start_ms_{0};
@@ -93,6 +107,13 @@ class ShutterHub : public Component {
   time::RealTimeClock *time_{nullptr};
 
   bool boot_sunset_check_done_{false};
+
+  // Feature 1 state. hour == 255 means backup_open_time was never configured,
+  // so the feature is inert and loop() early-returns before reading the clock.
+  uint8_t backup_open_hour_{255};
+  uint8_t backup_open_minute_{0};
+  bool    backup_open_fired_today_{false};
+  int16_t backup_open_last_day_{-1};
 
   ESPPreferenceObject positions_pref_;
   ShutterPositionBlock positions_block_;

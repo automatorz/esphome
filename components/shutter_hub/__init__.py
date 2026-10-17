@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 from esphome import automation
 from esphome.components import (
     cover, binary_sensor, sensor, text_sensor, sun, switch as switch_,
-    time as time_,
+    time as time_, button,
 )
 from esphome.const import CONF_ID, CONF_NAME, CONF_DEVICE_CLASS
 from esphome.core import CORE, ID
@@ -17,6 +17,7 @@ ns = cg.esphome_ns.namespace("shutter_hub")
 ShutterHub   = ns.class_("ShutterHub", cg.Component)
 Shutter      = ns.class_("Shutter", cover.Cover, cg.Component)
 ShutterGroup = ns.class_("ShutterGroup", cover.Cover, cg.Component)
+OpenAllButton = ns.class_("OpenAllButton", button.Button)
 
 WindowOrientation = ns.enum("WindowOrientation", True)
 WINDOW_ORIENTATIONS = {"EAST": WindowOrientation.EAST, "WEST": WindowOrientation.WEST}
@@ -50,6 +51,40 @@ CONF_RESTORE             = "restore"
 CONF_TIME_ID             = "time_id"
 CONF_STATUS_SENSOR       = "status_sensor"
 CONF_POSITION_SENSOR     = "position_sensor"
+CONF_BACKUP_OPEN_TIME    = "backup_open_time"
+CONF_OPEN_ALL_BUTTON     = "open_all_button"
+
+DEFAULT_OPEN_ALL_BUTTON_NAME = "Open All Shutters"
+
+
+def _parse_hhmm(value):
+    """Parse a plain "HH:MM" (seconds optional) time-of-day into (hour, minute).
+
+    Only hour and minute are used by Feature 1; any seconds component is parsed
+    for tolerance but ignored. Raises cv.Invalid on malformed input or ranges.
+    """
+    text = cv.string(value).strip()
+    parts = text.split(":")
+    if len(parts) not in (2, 3):
+        raise cv.Invalid(
+            f"'{CONF_BACKUP_OPEN_TIME}' must be HH:MM or HH:MM:SS, got '{text}'."
+        )
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if len(parts) == 3:
+            int(parts[2])  # validate seconds are numeric; value unused
+    except ValueError:
+        raise cv.Invalid(
+            f"'{CONF_BACKUP_OPEN_TIME}' must be numeric HH:MM(:SS), got '{text}'."
+        )
+    if not (0 <= hour <= 23):
+        raise cv.Invalid(f"'{CONF_BACKUP_OPEN_TIME}' hour must be 0..23, got {hour}.")
+    if not (0 <= minute <= 59):
+        raise cv.Invalid(
+            f"'{CONF_BACKUP_OPEN_TIME}' minute must be 0..59, got {minute}."
+        )
+    return hour, minute
 
 WINDOW_SCHEMA = cv.Schema({
     cv.Required(CONF_W): cv.positive_float,
@@ -129,6 +164,14 @@ NESTED_CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
     cv.Required(CONF_SHUTTERS): cv.ensure_list(NESTED_SHUTTER_SCHEMA),
     cv.Optional(CONF_GROUPS, default=[]): cv.ensure_list(GROUP_SCHEMA),
+    # Feature 1: single global time-of-day for the scheduled backup open.
+    cv.Optional(CONF_BACKUP_OPEN_TIME): _parse_hhmm,
+    # Feature 2: optional Open-All button. Accepts `{}` or `{name: ...}`.
+    cv.Optional(CONF_OPEN_ALL_BUTTON): button.button_schema(
+        OpenAllButton, icon="mdi:window-shutter-open"
+    ).extend({
+        cv.Optional(CONF_NAME, default=DEFAULT_OPEN_ALL_BUTTON_NAME): cv.string,
+    }),
 }).extend(cv.COMPONENT_SCHEMA)
 
 
@@ -241,6 +284,24 @@ async def build_shutter_hub(config, relay_resolver=None):
         for sh in g[CONF_SHUTTERS]:
             cg.add(gv.add_shutter(await cg.get_variable(sh)))
         cg.add(var.add_group(gv))
+
+    # Feature 1: scheduled backup open. The value is already parsed to
+    # (hour, minute) by _parse_hhmm during validation. Requires a time source.
+    if CONF_BACKUP_OPEN_TIME in config:
+        if CONF_TIME_ID not in config:
+            raise cv.Invalid(
+                f"'{CONF_BACKUP_OPEN_TIME}' requires a '{CONF_TIME_ID}:' "
+                "(RealTimeClock) to be configured."
+            )
+        hour, minute = config[CONF_BACKUP_OPEN_TIME]
+        cg.add(var.set_backup_open_time(hour, minute))
+
+    # Feature 2: Open-All button. The button is a button::Button (EntityBase
+    # only), registered via App.register_button, so it is NOT a counted
+    # component and needs no fabricated-id entry.
+    if CONF_OPEN_ALL_BUTTON in config:
+        btn = await button.new_button(config[CONF_OPEN_ALL_BUTTON])
+        cg.add(btn.set_hub(var))
 
     # Expose the hub var so an embedding component (mcp23017_shared_int) can wire
     # it into its sun_schedule handler. The standalone to_code ignores the return.

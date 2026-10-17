@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/application.h"
+#include "esphome/core/time.h"
 #include <algorithm>
 #include <cstring>
 
@@ -133,6 +134,29 @@ void ShutterHub::loop() {
             if (s->position_known && s->position <= 0.01f) continue;
             this->enqueue(s, Dir::DOWN, false);
           }
+        }
+      }
+    }
+  }
+
+  // Feature 1: scheduled backup open. Clock check only, no I2C. Inert until
+  // set_backup_open_time() is called (hour stays 255). Fires at most once per
+  // day via a latch that re-arms on a detected day change (and is also cleared
+  // by reset_daily_flags(), which the YAML midnight trigger invokes).
+  if (backup_open_hour_ != 255 && time_ != nullptr) {
+    auto t = time_->now();
+    if (t.is_valid()) {
+      if ((int16_t) t.day_of_year != backup_open_last_day_) {
+        backup_open_last_day_ = (int16_t) t.day_of_year;
+        backup_open_fired_today_ = false;
+      }
+      if (!backup_open_fired_today_) {
+        uint16_t now_minutes = (uint16_t) t.hour * 60 + t.minute;
+        uint16_t target_minutes =
+            (uint16_t) backup_open_hour_ * 60 + backup_open_minute_;
+        if (now_minutes >= target_minutes) {
+          this->maybe_backup_open_();
+          backup_open_fired_today_ = true;
         }
       }
     }
@@ -379,6 +403,41 @@ bool ShutterHub::sun_through_active(ShutterGroup *g) {
   return g->compute_sun_through_raw(az, el);
 }
 
+void ShutterHub::maybe_backup_open_() {
+  // Backup open: for groups that close at sunset but do NOT open at sunrise,
+  // open any member still closed. Skip the whole group if it was already
+  // opened/cancelled today or is currently closed by sun-through. Movement is
+  // one shutter at a time through the hub queue, mirroring schedule_sunrise_open.
+  ESP_LOGI(TAG, "Backup open: checking groups at %02u:%02u",
+           (unsigned) backup_open_hour_, (unsigned) backup_open_minute_);
+  for (auto *g : groups_) {
+    if (!g->close_at_sunset() || g->open_at_sunrise()) continue;
+    if (g->sunrise_cancelled_today || g->closed_by_sun_through) continue;
+    for (auto *s : g->shutters()) {
+      // Only open members that are currently closed; skip the rest.
+      if (!(s->position_known && s->position <= 0.01f)) continue;
+      this->enqueue(s, Dir::UP, false);
+    }
+    // Treat the backup open as the morning open having happened for this group.
+    g->sunrise_cancelled_today = true;
+  }
+}
+
+void ShutterHub::open_all_closed_no_override() {
+  // Open every currently-closed shutter across all groups EXCEPT groups closed
+  // by sun-through or already opened/cancelled today. One shutter at a time
+  // through the hub queue; never drives relays directly.
+  ESP_LOGI(TAG, "Open-all: opening all closed shutters (no override)");
+  for (auto *g : groups_) {
+    if (g->closed_by_sun_through) continue;
+    if (g->sunrise_cancelled_today) continue;
+    for (auto *s : g->shutters()) {
+      if (!(s->position_known && s->position <= 0.01f)) continue;
+      this->enqueue(s, Dir::UP, false);
+    }
+  }
+}
+
 void ShutterHub::schedule_sunrise_open() {
   for (auto *g : groups_) {
     if (!g->open_at_sunrise() || g->sunrise_cancelled_today) continue;
@@ -444,6 +503,8 @@ void ShutterHub::reset_daily_flags() {
     g->sun_through_cancelled_today = false;
     g->closed_by_sun_through       = false;
   }
+  // Re-arm Feature 1 so the backup open can fire again on the new day.
+  backup_open_fired_today_ = false;
   ESP_LOGD(TAG, "Daily flags reset");
 }
 
