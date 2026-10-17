@@ -110,7 +110,6 @@ bool MCP23017Chip::read_inputs(uint16_t *out) {
   return this->read_u16_(REG_GPIOA, out);
 }
 
-bool MCP23017Chip::read_intf(uint16_t *out) { return this->read_u16_(REG_INTFA, out); }
 
 void MCP23017Chip::write_output(uint8_t pin, bool value) {
   if (pin > 15)

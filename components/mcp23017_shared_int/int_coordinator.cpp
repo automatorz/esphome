@@ -48,27 +48,6 @@ void SharedIntCoordinator::setup() {
   // so all listener setup() calls have completed first.
   this->force_initial_publish_ = true;
   this->enable_loop();
-
-  // TEMP ONE-SHOT idle probe (single fire; one I2C read burst, NOT steady-state
-  // polling). 10 s after boot, with NOTHING pressed, read INTF + current input
-  // level for every chip once. INT is stuck low at idle, so this shows WHICH
-  // chip(s) and pins are asserting the interrupt at idle - almost certainly
-  // unconnected/floating input pins that have interrupt-on-change enabled.
-  this->set_timeout("mcp_idle_intf", 10000, [this]() {
-    const int level =
-        (this->interrupt_pin_ != nullptr) ? (this->interrupt_pin_->digital_read() ? 1 : 0) : -1;
-    ESP_LOGW(TAG, "IDLE-INTF: INT pin level=%d (nothing should be pressed)", level);
-    for (auto *chip : this->chips_) {
-      uint16_t intf = 0, gpio = 0;
-      const bool ok_intf = chip->read_intf(&intf);
-      const bool ok_gpio = chip->read_inputs(&gpio);
-      ESP_LOGW(TAG,
-               "IDLE-INTF: 0x%02X intf_ok=%s INTF=0x%04X gpio_ok=%s GPIO=0x%04X "
-               "input_mask=0x%04X",
-               chip->get_i2c_address(), ok_intf ? "y" : "N", intf, ok_gpio ? "y" : "N",
-               gpio, chip->get_input_mask());
-    }
-  });
 }
 
 void SharedIntCoordinator::loop() {
