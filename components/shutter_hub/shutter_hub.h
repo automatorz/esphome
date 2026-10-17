@@ -113,7 +113,11 @@ class ShutterHub : public Component {
   uint8_t backup_open_hour_{255};
   uint8_t backup_open_minute_{0};
   bool    backup_open_fired_today_{false};
-  int16_t backup_open_last_day_{-1};
+
+  // Day-rollover detector for the internal daily reset. When the calendar day
+  // changes, loop() calls reset_daily_flags() once (no external midnight
+  // on_time trigger needed). -1 until the first valid clock read.
+  int16_t reset_last_day_{-1};
 
   ESPPreferenceObject positions_pref_;
   ShutterPositionBlock positions_block_;

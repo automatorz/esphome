@@ -139,18 +139,24 @@ void ShutterHub::loop() {
     }
   }
 
-  // Feature 1: scheduled backup open. Clock check only, no I2C. Inert until
-  // set_backup_open_time() is called (hour stays 255). Fires at most once per
-  // day via a latch that re-arms on a detected day change (and is also cleared
-  // by reset_daily_flags(), which the YAML midnight trigger invokes).
-  if (backup_open_hour_ != 255 && time_ != nullptr) {
+  // Daily housekeeping + scheduled backup open. Clock check only, no I2C.
+  if (time_ != nullptr) {
     auto t = time_->now();
     if (t.is_valid()) {
-      if ((int16_t) t.day_of_year != backup_open_last_day_) {
-        backup_open_last_day_ = (int16_t) t.day_of_year;
-        backup_open_fired_today_ = false;
+      // Day rollover: reset the per-group daily-cancel flags (and re-arm the
+      // backup-open latch) exactly once when a new calendar day begins. This is
+      // internal now — no external midnight on_time trigger is required.
+      // reset_daily_flags() clears backup_open_fired_today_, so it must run
+      // before the backup-open check below. Guarded so it fires once per day.
+      if ((int16_t) t.day_of_year != reset_last_day_) {
+        reset_last_day_ = (int16_t) t.day_of_year;
+        this->reset_daily_flags();
       }
-      if (!backup_open_fired_today_) {
+
+      // Feature 1: scheduled backup open. Inert until set_backup_open_time() is
+      // called (hour stays 255). Fires at most once per day via the latch that
+      // reset_daily_flags() re-armed at the day rollover above.
+      if (backup_open_hour_ != 255 && !backup_open_fired_today_) {
         uint16_t now_minutes = (uint16_t) t.hour * 60 + t.minute;
         uint16_t target_minutes =
             (uint16_t) backup_open_hour_ * 60 + backup_open_minute_;
