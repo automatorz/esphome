@@ -490,20 +490,45 @@ void ShutterHub::on_sun_update() {
     if (!g->close_on_sun_through()) continue;
     if (g->sun_through_cancelled_today) continue;
     if (this->heating_needed_on()) continue;
-    if (active && !g->closed_by_sun_through) {
+    if (active) {
+      // Sun is shining through: close any member not already closed. Only set
+      // closed_by_sun_through when we ACTUALLY enqueued a close — previously it
+      // was set unconditionally, so a shutter already closed from the prior
+      // sunset got falsely flagged as "closed by sun-through". With the reopen
+      // logic below no longer depending on that flag this is just hygiene, but
+      // it keeps the flag honest for telemetry/other logic.
+      bool closed_any = false;
       for (auto *s : g->shutters()) {
-        // Option (b): skip members already closed.
-        if (s->position_known && s->position <= 0.01f) continue;
+        if (s->position_known && s->position <= 0.01f) continue;  // already closed
         this->enqueue(s, Dir::DOWN, false);
+        closed_any = true;
       }
-      g->closed_by_sun_through = true;
-    } else if (!active && g->closed_by_sun_through) {
+      if (closed_any)
+        g->closed_by_sun_through = true;
+    } else {
+      // Sun-through has ended. Reopen if this is a daylight-open group
+      // (open_at_sunrise), there is still meaningful daylight left
+      // (el > elevation_margin), and the user has not manually overridden the
+      // group today. This is INDEPENDENT of closed_by_sun_through and of
+      // close_at_sunset: it performs the daytime open that may have been
+      // suppressed at sunrise (suppress_sunrise_if_sun_through) and never
+      // retried, OR reverses a sun-through close. The elevation gate naturally
+      // lets an EAST window reopen (sun still high when its morning sun-through
+      // ends) while preventing a pointless dusk reopen on a WEST window (sun
+      // already low when its afternoon sun-through ends, just before the
+      // sunset close).
       float el = this->sun_elevation();
-      if (!g->close_at_sunset() && !std::isnan(el) &&
-          el > g->elevation_margin()) {
+      // is_overridden() covers ANY manual command today (sunrise_cancelled_today
+      // from a manual open, sunset_cancelled_today from a manual close, or
+      // sun_through_cancelled_today). A manual DOWN sets only
+      // sunset_cancelled_today, so gating on is_overridden() (not just
+      // sunrise_cancelled_today) prevents this branch from re-opening a shutter
+      // the user deliberately closed mid-day. (sun_through_cancelled_today is
+      // also already short-circuited at the top of this function.)
+      if (g->open_at_sunrise() && !g->is_overridden() &&
+          !std::isnan(el) && el > g->elevation_margin()) {
         for (auto *s : g->shutters()) {
-          // Option (b): skip members already open.
-          if (s->position_known && s->position >= 0.99f) continue;
+          if (s->position_known && s->position >= 0.99f) continue;  // already open
           this->enqueue(s, Dir::UP, false);
         }
       }
