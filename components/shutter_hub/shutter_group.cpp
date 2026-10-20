@@ -12,6 +12,10 @@ static constexpr float POS_EPSILON = 0.005f;
 
 void ShutterGroup::setup() {
   this->update_state(true);
+  // Publish the initial "overridden" state (false at boot; flags default
+  // false). setup runs at setup_priority::LATE, after codegen wiring, so
+  // overridden_sensor_ is set.
+  this->publish_overridden();
 }
 
 void ShutterGroup::dump_config() {
@@ -46,6 +50,7 @@ void ShutterGroup::control(const cover::CoverCall &call) {
     } else {
       this->sunset_cancelled_today = true;
     }
+    this->publish_overridden();
     for (auto *s : shutters_) s->apply_manual_command(d);
   }
 }
@@ -165,6 +170,7 @@ void ShutterGroup::fire_click_(uint8_t count, bool is_up) {
     } else {
       this->sunset_cancelled_today = true;
     }
+    this->publish_overridden();
     for (auto *s : shutters_) if (hub_ != nullptr) hub_->enqueue(s, d, true);
   } else if (count == 3) {
     if (hub_ != nullptr) hub_->cancel_group(this);
@@ -173,6 +179,11 @@ void ShutterGroup::fire_click_(uint8_t count, bool is_up) {
 
 void ShutterGroup::publish_sun_through(bool on) {
   if (sun_through_sensor_ != nullptr) sun_through_sensor_->publish_state(on);
+}
+
+void ShutterGroup::publish_overridden() {
+  if (overridden_sensor_ != nullptr)
+    overridden_sensor_->publish_state(this->is_overridden());
 }
 
 bool ShutterGroup::compute_sun_through_raw(float az, float el) const {

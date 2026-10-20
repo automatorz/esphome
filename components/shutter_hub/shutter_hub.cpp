@@ -518,6 +518,7 @@ void ShutterHub::reset_daily_flags() {
     g->sunset_cancelled_today      = false;
     g->sun_through_cancelled_today = false;
     g->closed_by_sun_through       = false;
+    g->publish_overridden();
   }
   // Re-arm Feature 1 so the backup open can fire again on the new day.
   backup_open_fired_today_ = false;

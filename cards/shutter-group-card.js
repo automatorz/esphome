@@ -1,6 +1,6 @@
 /**
  * shutter-group-card
- * Version: v0.6.2 (2026-10-10)
+ * Version: v0.7.0 (2026-10-11)
  *
  * A Lovelace custom card for the `shutter_hub` ESPHome component.
  *
@@ -32,12 +32,15 @@
  *   # optional: a sun icon (grey = not through, yellow = shining through) shown
  *   # between the shutter icons and the control buttons. Omit for no sun icon.
  *   sun_through_entity: binary_sensor.bedroom_c_sun_through
+ *   # optional: group-level override indicator; when "on", a small red dot is
+ *   # shown on the lower-right of every member shutter icon.
+ *   overridden_entity: binary_sensor.bedroom_c_group_overridden
  *
  * No build step. Drop this file in HA's config/www/ and register it as a
  * dashboard resource (JavaScript Module), then use type: custom:shutter-group-card.
  */
 
-const CARD_VERSION = "v0.6.2 (2026-10-10)";
+const CARD_VERSION = "v0.7.0 (2026-10-11)";
 
 // ---------------------------------------------------------------------------
 // Appearance configuration. Edit these constants to tune the card's look for
@@ -55,6 +58,10 @@ const CONFIG = {
 
   // Sun-through indicator.
   sunIconSize: 24,               // px
+
+  // Per-member "overridden today" dot (lower-right of each shutter icon).
+  overrideDotSize: 8,            // px — diameter of the red dot
+  overrideDotColor: "var(--error-color, #e53935)", // dot fill color
 
   // Control buttons (the tile-style open/stop/close group).
   buttonSize: 32,                // px — button height / touch target
@@ -283,10 +290,15 @@ class ShutterGroupCard extends HTMLElement {
       icon.className = "sg-icon";
       const label = document.createElement("div");
       label.className = "sg-label";
+      // "Overridden today" dot, created once as a child of .sg-icon (which is
+      // position: relative). Hidden by default; toggled in _update().
+      const dot = document.createElement("span");
+      dot.className = "sg-dot";
+      icon.appendChild(dot);
       cell.appendChild(icon);
       cell.appendChild(label);
       this._membersEl.appendChild(cell);
-      return { cell, icon, label };
+      return { cell, icon, label, dot };
     });
 
     // Optional sun-through indicator, between the member icons and the
@@ -389,6 +401,12 @@ class ShutterGroupCard extends HTMLElement {
       const on = this._stateOf(this._config.sun_through_entity) === "on";
       this._sunEl.classList.toggle("sg-sun-on", on);
     }
+
+    // Group-level "overridden today" dot: when the override entity is "on",
+    // show the red dot on every member icon; otherwise hide them all.
+    const overridden = this._config.overridden_entity &&
+      this._stateOf(this._config.overridden_entity) === "on";
+    this._cells.forEach((c) => c.dot.classList.toggle("sg-dot-on", !!overridden));
   }
 
   _styles() {
@@ -428,8 +446,21 @@ class ShutterGroupCard extends HTMLElement {
           align-items: center;
           min-width: ${Math.max(iconW + 12, 40)}px;
         }
-        .sg-icon { width: ${iconW}px; height: ${iconH}px; }
+        .sg-icon { width: ${iconW}px; height: ${iconH}px; position: relative; }
         .sg-svg { width: 100%; height: 100%; display: block; }
+        /* "Overridden today" dot, lower-right of each member icon. Hidden until
+           the group's override entity is "on". */
+        .sg-dot {
+          position: absolute;
+          right: -2px;
+          bottom: -2px;
+          width: ${c.overrideDotSize}px;
+          height: ${c.overrideDotSize}px;
+          border-radius: 50%;
+          background: ${c.overrideDotColor};
+          display: none;
+        }
+        .sg-dot.sg-dot-on { display: block; }
         .sg-frame {
           fill: none;
           stroke: ${c.shutterColor};

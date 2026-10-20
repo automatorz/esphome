@@ -38,6 +38,7 @@ class ShutterGroup : public cover::Cover, public Component {
   void set_suppress_sunrise_if_sun_through(bool v) { suppress_sunrise_ = v; }
   void set_close_on_sun_through(bool v) { close_on_sun_through_ = v; }
   void set_sun_through_sensor(binary_sensor::BinarySensor *b) { sun_through_sensor_ = b; }
+  void set_overridden_sensor(binary_sensor::BinarySensor *b) { overridden_sensor_ = b; }
   void set_window(float w, float d, float h, WindowOrientation o, float margin) {
     window_.w = w; window_.d = d; window_.h = h;
     window_.o = o; window_.margin = margin;
@@ -54,6 +55,16 @@ class ShutterGroup : public cover::Cover, public Component {
   float elevation_margin() const { return window_.margin; }
   bool compute_sun_through_raw(float az, float el) const;
   void publish_sun_through(bool on);
+
+  // "Overridden today": a manual command on this group has suppressed one of
+  // its sun automations for the day. Reuses the existing daily-cancel flags;
+  // closed_by_sun_through is deliberately excluded (it is an automation state,
+  // not a manual override).
+  bool is_overridden() const {
+    return sunrise_cancelled_today || sunset_cancelled_today ||
+           sun_through_cancelled_today;
+  }
+  void publish_overridden();
 
   // Daily-cancel flags (relocated from Shutter). A manual command on this
   // group sets these; reset_daily_flags() clears them.
@@ -77,6 +88,7 @@ class ShutterGroup : public cover::Cover, public Component {
   ShutterHub *hub_{nullptr};
   binary_sensor::BinarySensor *up_btn_{nullptr}, *down_btn_{nullptr};
   binary_sensor::BinarySensor *sun_through_sensor_{nullptr};
+  binary_sensor::BinarySensor *overridden_sensor_{nullptr};
   std::vector<Shutter *> shutters_;
   bool open_at_sunrise_{false}, close_at_sunset_{false};
   uint32_t sunrise_off_ms_{0}, sunset_off_ms_{0};

@@ -18,6 +18,7 @@ ShutterHub   = ns.class_("ShutterHub", cg.Component)
 Shutter      = ns.class_("Shutter", cover.Cover, cg.Component)
 ShutterGroup = ns.class_("ShutterGroup", cover.Cover, cg.Component)
 OpenAllButton = ns.class_("OpenAllButton", button.Button)
+ClearOverridesButton = ns.class_("ClearOverridesButton", button.Button)
 
 WindowOrientation = ns.enum("WindowOrientation", True)
 WINDOW_ORIENTATIONS = {"EAST": WindowOrientation.EAST, "WEST": WindowOrientation.WEST}
@@ -53,8 +54,10 @@ CONF_STATUS_SENSOR       = "status_sensor"
 CONF_POSITION_SENSOR     = "position_sensor"
 CONF_BACKUP_OPEN_TIME    = "backup_open_time"
 CONF_OPEN_ALL_BUTTON     = "open_all_button"
+CONF_CLEAR_OVERRIDES_BUTTON = "clear_overrides_button"
 
 DEFAULT_OPEN_ALL_BUTTON_NAME = "Open All Shutters"
+DEFAULT_CLEAR_OVERRIDES_BUTTON_NAME = "Clear Shutter Overrides"
 
 
 def _parse_hhmm(value):
@@ -172,6 +175,13 @@ NESTED_CONFIG_SCHEMA = cv.Schema({
     ).extend({
         cv.Optional(CONF_NAME, default=DEFAULT_OPEN_ALL_BUTTON_NAME): cv.string,
     }),
+    # Feature 2 (overrides): optional Clear-Overrides button. Accepts `{}` or
+    # `{name: ...}`. Pressing it is a manual reset_daily_flags().
+    cv.Optional(CONF_CLEAR_OVERRIDES_BUTTON): button.button_schema(
+        ClearOverridesButton, icon="mdi:restore"
+    ).extend({
+        cv.Optional(CONF_NAME, default=DEFAULT_CLEAR_OVERRIDES_BUTTON_NAME): cv.string,
+    }),
 }).extend(cv.COMPONENT_SCHEMA)
 
 
@@ -281,6 +291,20 @@ async def build_shutter_hub(config, relay_resolver=None):
         if CONF_SUN_THROUGH_SENSOR in g:
             cg.add(gv.set_sun_through_sensor(
                 await cg.get_variable(g[CONF_SUN_THROUGH_SENSOR])))
+        # Per-group "overridden today" binary_sensor, fabricated at codegen the
+        # same way the per-shutter telemetry entities are (always on, no config).
+        # A plain binary_sensor::BinarySensor (EntityBase only), registered via
+        # App.register_binary_sensor, NOT a counted Component.
+        group_name = g.get(CONF_NAME) or str(g[CONF_ID])
+        ov_conf = binary_sensor.binary_sensor_schema(
+            icon="mdi:gesture-tap",
+        )({
+            CONF_ID: _declare_entity_id(
+                f"{g[CONF_ID]}_overridden", binary_sensor.BinarySensor),
+            CONF_NAME: f"{group_name} Overridden",
+        })
+        ov = await binary_sensor.new_binary_sensor(ov_conf)
+        cg.add(gv.set_overridden_sensor(ov))
         for sh in g[CONF_SHUTTERS]:
             cg.add(gv.add_shutter(await cg.get_variable(sh)))
         cg.add(var.add_group(gv))
@@ -301,6 +325,14 @@ async def build_shutter_hub(config, relay_resolver=None):
     # component and needs no fabricated-id entry.
     if CONF_OPEN_ALL_BUTTON in config:
         btn = await button.new_button(config[CONF_OPEN_ALL_BUTTON])
+        cg.add(btn.set_hub(var))
+
+    # Feature 2 (overrides): Clear-Overrides button. Like the Open-All button it
+    # is a button::Button (EntityBase only), registered via App.register_button,
+    # so it is NOT a counted component and needs no fabricated-id entry. Pressing
+    # it runs a manual reset_daily_flags().
+    if CONF_CLEAR_OVERRIDES_BUTTON in config:
+        btn = await button.new_button(config[CONF_CLEAR_OVERRIDES_BUTTON])
         cg.add(btn.set_hub(var))
 
     # Expose the hub var so an embedding component (mcp23017_shared_int) can wire

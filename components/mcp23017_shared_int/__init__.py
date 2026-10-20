@@ -771,6 +771,13 @@ def _fabricated_shutter_hub_ids(config):
             yield sanitize(snake_case(f"{base_name}_status"))
         if shutter.get("position_sensor", True):
             yield sanitize(snake_case(f"{base_name}_position"))
+    # Per-group "overridden" binary_sensor, fabricated at codegen by
+    # shutter_hub.build_shutter_hub (one per group, id "<group_id>_overridden").
+    # Yielded here with the SAME sanitize(snake_case(...)) form so
+    # CORE.component_ids (hence ESPHOME_COMPONENT_COUNT) stays consistent.
+    for group in sh.get("groups", []):
+        gid = str(group[CONF_ID])
+        yield sanitize(snake_case(f"{gid}_overridden"))
 
 
 # Deterministic ids for the Component-derived objects synthesized by the
