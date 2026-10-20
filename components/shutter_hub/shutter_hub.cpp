@@ -153,14 +153,35 @@ void ShutterHub::loop() {
   if (time_ != nullptr) {
     auto t = time_->now();
     if (t.is_valid()) {
-      // Day rollover: reset the per-group daily-cancel flags (and re-arm the
-      // backup-open latch) exactly once when a new calendar day begins. This is
-      // internal now — no external midnight on_time trigger is required.
-      // reset_daily_flags() clears backup_open_fired_today_, so it must run
-      // before the backup-open check below. Guarded so it fires once per day.
+      // Day rollover: reset the per-group daily-cancel flags AND re-arm the
+      // backup-open latch, exactly once when a new calendar day begins. This is
+      // internal now — no external midnight on_time trigger is required. The
+      // latch re-arm lives HERE (not in reset_daily_flags()) so it only happens
+      // at the true rollover, where the clock is at ~00:00 (before
+      // backup_open_time) and the backup open therefore waits for the configured
+      // time rather than firing immediately. The manual "Clear Overrides" button
+      // also calls reset_daily_flags() but must NOT re-arm the latch (it can be
+      // pressed after backup_open_time, which would fire the open retroactively).
+      // Guarded so it runs once per day.
       if ((int16_t) t.day_of_year != reset_last_day_) {
+        const bool first_sync = (reset_last_day_ == -1);
         reset_last_day_ = (int16_t) t.day_of_year;
         this->reset_daily_flags();
+        // Re-arm the backup-open latch for the new day. EXCEPT on the very first
+        // clock sync after boot: if the device boots/syncs AFTER backup_open_time
+        // (e.g. a reboot in the evening), arming it would make the backup open
+        // fire retroactively and open shutters at night. On first sync, only arm
+        // if we are still BEFORE the configured time today; otherwise treat it as
+        // already fired for today. True midnight rollovers always arm (00:00 is
+        // before any sane backup_open_time).
+        if (first_sync && backup_open_hour_ != 255) {
+          uint16_t now_minutes = (uint16_t) t.hour * 60 + t.minute;
+          uint16_t target_minutes =
+              (uint16_t) backup_open_hour_ * 60 + backup_open_minute_;
+          this->backup_open_fired_today_ = (now_minutes >= target_minutes);
+        } else {
+          this->backup_open_fired_today_ = false;
+        }
       }
 
       // Feature 1: scheduled backup open. Inert until set_backup_open_time() is
@@ -538,6 +559,18 @@ void ShutterHub::on_sun_update() {
 }
 
 void ShutterHub::reset_daily_flags() {
+  // Clears the per-group manual-override / sun-through daily flags and
+  // republishes the override sensors. Called in TWO situations:
+  //   1. the internal midnight day-rollover (loop()), and
+  //   2. the manual "Clear Shutter Overrides" button, which can be pressed at
+  //      ANY time of day.
+  // It deliberately does NOT re-arm the backup-open latch
+  // (backup_open_fired_today_). Re-arming is done ONLY by the day-rollover in
+  // loop(), where it is safe because the clock is at 00:00 (before the configured
+  // backup_open_time). Re-arming here would let the button retroactively trigger
+  // the backup open: pressing it in the evening (now >= backup_open_time) would
+  // immediately open every close-at-sunset/not-open-at-sunrise shutter — the bug
+  // observed when the button opened shutters at night.
   for (auto *g : groups_) {
     g->sunrise_cancelled_today     = false;
     g->sunset_cancelled_today      = false;
@@ -545,8 +578,6 @@ void ShutterHub::reset_daily_flags() {
     g->closed_by_sun_through       = false;
     g->publish_overridden();
   }
-  // Re-arm Feature 1 so the backup open can fire again on the new day.
-  backup_open_fired_today_ = false;
   ESP_LOGD(TAG, "Daily flags reset");
 }
 
