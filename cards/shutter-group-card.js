@@ -1,6 +1,6 @@
 /**
  * shutter-group-card
- * Version: v0.7.0 (2026-10-11)
+ * Version: v0.7.1 (2026-10-11)
  *
  * A Lovelace custom card for the `shutter_hub` ESPHome component.
  *
@@ -40,7 +40,7 @@
  * dashboard resource (JavaScript Module), then use type: custom:shutter-group-card.
  */
 
-const CARD_VERSION = "v0.7.0 (2026-10-11)";
+const CARD_VERSION = "v0.7.1 (2026-10-11)";
 
 // ---------------------------------------------------------------------------
 // Appearance configuration. Edit these constants to tune the card's look for
@@ -288,17 +288,24 @@ class ShutterGroupCard extends HTMLElement {
       cell.className = "sg-member";
       const icon = document.createElement("div");
       icon.className = "sg-icon";
+      // The SVG lives in its own wrapper whose innerHTML is replaced on each
+      // update. The override dot is a SIBLING of that wrapper (both children of
+      // .sg-icon), so replacing the SVG does NOT destroy the dot. (Previously
+      // the dot was a child of .sg-icon and icon.innerHTML = svg wiped it out
+      // every update, so it never appeared.)
+      const svg = document.createElement("div");
+      svg.className = "sg-svg-wrap";
       const label = document.createElement("div");
       label.className = "sg-label";
-      // "Overridden today" dot, created once as a child of .sg-icon (which is
-      // position: relative). Hidden by default; toggled in _update().
+      // "Overridden today" dot, created once; shown via .sg-dot-on in _update().
       const dot = document.createElement("span");
       dot.className = "sg-dot";
+      icon.appendChild(svg);
       icon.appendChild(dot);
       cell.appendChild(icon);
       cell.appendChild(label);
       this._membersEl.appendChild(cell);
-      return { cell, icon, label, dot };
+      return { cell, icon, svg, label, dot };
     });
 
     // Optional sun-through indicator, between the member icons and the
@@ -391,7 +398,9 @@ class ShutterGroupCard extends HTMLElement {
       const cell = this._cells[i];
       cell.cell.className = ["sg-member", moving ? "sg-moving" : "", queued ? "sg-queued" : ""]
         .join(" ").trim();
-      cell.icon.innerHTML = shutterSvg(pct, overlay);
+      // Write only the SVG wrapper's contents, NOT the whole icon — otherwise
+      // the override dot (a sibling inside .sg-icon) would be destroyed.
+      cell.svg.innerHTML = shutterSvg(pct, overlay);
       cell.label.textContent = label;
     });
 
@@ -447,6 +456,7 @@ class ShutterGroupCard extends HTMLElement {
           min-width: ${Math.max(iconW + 12, 40)}px;
         }
         .sg-icon { width: ${iconW}px; height: ${iconH}px; position: relative; }
+        .sg-svg-wrap { width: 100%; height: 100%; display: block; }
         .sg-svg { width: 100%; height: 100%; display: block; }
         /* "Overridden today" dot, lower-right of each member icon. Hidden until
            the group's override entity is "on". */
