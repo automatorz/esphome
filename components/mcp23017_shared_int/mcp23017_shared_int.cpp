@@ -114,13 +114,22 @@ bool MCP23017Chip::read_inputs(uint16_t *out) {
 void MCP23017Chip::write_output(uint8_t pin, bool value) {
   if (pin > 15)
     return;
+  // Write OLAT with read-back verification + retry (write_verify_). A plain
+  // single write that silently NACKed left the relay physically in its old
+  // state while the cached OLAT believed the new state — observed as a shutter
+  // relay stuck energized after the evening close, with HA showing it off.
+  // Verifying against the just-written OLAT (not a re-read of pin state) is
+  // race-free: olat_a_/olat_b_ is the single source of truth and all OLAT
+  // writes are sequential in the loop context (no ISR writes OLAT), so there is
+  // no read-modify-write window. If it still cannot verify after retries,
+  // write_verify_ logs an error (useful signal that the bus is failing).
   if (pin < 8) {
     if (value) {
       this->olat_a_ |= uint8_t(1 << pin);
     } else {
       this->olat_a_ &= ~uint8_t(1 << pin);
     }
-    this->write_reg_(REG_OLATA, this->olat_a_);
+    this->write_verify_(REG_OLATA, this->olat_a_);
   } else {
     const uint8_t bit = pin - 8;
     if (value) {
@@ -128,7 +137,7 @@ void MCP23017Chip::write_output(uint8_t pin, bool value) {
     } else {
       this->olat_b_ &= ~uint8_t(1 << bit);
     }
-    this->write_reg_(REG_OLATB, this->olat_b_);
+    this->write_verify_(REG_OLATB, this->olat_b_);
   }
 }
 

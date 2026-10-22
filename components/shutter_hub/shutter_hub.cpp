@@ -235,6 +235,15 @@ void ShutterHub::begin_request_() {
   queue_.pop_front();
   active_ = r.shutter;
   active_dir_ = r.dir;
+  // CRASH BREADCRUMB (low volume: once per movement start). We've seen a rare
+  // (~weekly) StoreProhibited null write; this records which shutter is about to
+  // be driven RIGHT BEFORE the dereferences below, so if the crash is here the
+  // last log line names the shutter (and an active_==nullptr here would be the
+  // smoking gun — a null Request.shutter). Deliberately NOT guarded: the user
+  // wants it to crash so the esp32.crash backtrace + uptime reset are visible.
+  ESP_LOGD(TAG, "begin_request_: active_=%p dir=%s queue_remaining=%u",
+           (void *) active_, active_dir_ == Dir::UP ? "UP" : "DOWN",
+           (unsigned) queue_.size());
   active_start_pos_ = active_->position_known ? active_->position
                        : (r.dir == Dir::UP ? 0.0f : 1.0f);
   float target = (r.dir == Dir::UP) ? 1.0f : 0.0f;
