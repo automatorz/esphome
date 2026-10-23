@@ -518,8 +518,13 @@ void ShutterHub::on_sun_update() {
     bool active = this->sun_through_active(g);
     g->publish_sun_through(active);
     if (!g->close_on_sun_through()) continue;
-    if (g->sun_through_cancelled_today) continue;
-    if (this->heating_needed_on()) continue;
+    // For the cancelled / heating paths we take no sun-through ACTION, but we
+    // still track the edge so that when the suppression clears, the NEXT update
+    // does not see a stale prev-active and fire a spurious reopen.
+    if (g->sun_through_cancelled_today || this->heating_needed_on()) {
+      g->sun_through_prev_active_ = active;
+      continue;
+    }
     if (active) {
       // Sun is shining through: close any member not already closed. Only set
       // closed_by_sun_through when we ACTUALLY enqueued a close — previously it
@@ -548,15 +553,20 @@ void ShutterHub::on_sun_update() {
       // already low when its afternoon sun-through ends, just before the
       // sunset close).
       float el = this->sun_elevation();
-      // is_overridden() covers ANY manual command today (sunrise_cancelled_today
-      // from a manual open, sunset_cancelled_today from a manual close, or
-      // sun_through_cancelled_today). A manual DOWN sets only
-      // sunset_cancelled_today, so gating on is_overridden() (not just
-      // sunrise_cancelled_today) prevents this branch from re-opening a shutter
-      // the user deliberately closed mid-day. (sun_through_cancelled_today is
-      // also already short-circuited at the top of this function.)
-      if (g->open_at_sunrise() && !g->is_overridden() &&
-          !std::isnan(el) && el > g->elevation_margin()) {
+      // EDGE GATE: only reopen on a genuine active->inactive transition
+      // (sun_through_prev_active_ was true), NOT on any standalone inactive
+      // reading. This is what fixes the reboot glitch: at boot (or while the sun
+      // sensors are still settling, az/el briefly NaN -> active=false) there is
+      // no prior active state, so no edge, so a sun-through-closed shutter is
+      // NOT spuriously opened-then-closed. It also matches the real intent:
+      // reopen WHEN the sun stops shining through, not merely whenever it isn't.
+      //
+      // is_overridden() covers ANY manual command today (manual open/close or
+      // sun_through cancel), so a shutter the user deliberately closed mid-day
+      // is not reopened. The elevation gate lets EAST reopen at midday while
+      // preventing a pointless WEST dusk reopen.
+      if (g->sun_through_prev_active_ && g->open_at_sunrise() &&
+          !g->is_overridden() && !std::isnan(el) && el > g->elevation_margin()) {
         for (auto *s : g->shutters()) {
           if (s->position_known && s->position >= 0.99f) continue;  // already open
           this->enqueue(s, Dir::UP, false);
@@ -564,6 +574,8 @@ void ShutterHub::on_sun_update() {
       }
       g->closed_by_sun_through = false;
     }
+    // Record this reading for the next update's edge detection.
+    g->sun_through_prev_active_ = active;
   }
 }
 

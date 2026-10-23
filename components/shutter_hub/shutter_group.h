@@ -73,6 +73,16 @@ class ShutterGroup : public cover::Cover, public Component {
   bool sun_through_cancelled_today{false};
   bool closed_by_sun_through{false};
 
+  // Previous sun-through "active" reading, so the reopen fires only on a true
+  // active->inactive EDGE (sun-through actually ended) rather than on any
+  // standalone inactive reading. Starts false so that at boot, or while the sun
+  // sensors are still settling (az/el briefly NaN -> sun_through_active()
+  // returns false), there is NO edge and therefore NO spurious reopen. A
+  // sun-through-closed shutter that reboots thus stays closed instead of
+  // briefly opening then re-closing. NOT reset by reset_daily_flags() — it
+  // tracks the physical sun state, not a daily decision.
+  bool sun_through_prev_active_{false};
+
   void update_state(bool force = false);
 
  private:
