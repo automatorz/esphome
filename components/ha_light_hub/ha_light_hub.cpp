@@ -15,8 +15,8 @@
 // and APIServer::send_homeassistant_action, so if either define is ever absent
 // the send becomes a genuine no-op rather than referencing a compiled-out class.
 #if defined(USE_API) && defined(USE_API_HOMEASSISTANT_SERVICES)
-#include "esphome/components/api/homeassistant_service.h"
 #include "esphome/components/api/api_server.h"
+#include "esphome/components/api/api_pb2.h"
 #endif
 
 namespace esphome {
@@ -108,17 +108,33 @@ void HaLightDimmer::call_turn_on_(uint8_t pct) {
   this->pending_pct_ = pct;
   this->pending_set_ms_ = millis();
 #if defined(USE_API) && defined(USE_API_HOMEASSISTANT_SERVICES)
-  char pct_buf[8];
-  snprintf(pct_buf, sizeof(pct_buf), "%u", (unsigned) pct);
+  if (api::global_api_server == nullptr)
+    return;
+  // ESPHome 2026.10.0 replaced the runtime set_service/init_data/add_data
+  // interface of HomeAssistantServiceCallAction with a codegen-built static
+  // fields table, which does not fit a dynamically-built call. Build the
+  // HomeassistantActionRequest ourselves and send it directly — exactly what
+  // the action's play() does internally. NOTE: HomeassistantActionRequest and
+  // HomeassistantServiceMap use non-owning StringRef, so the backing std::string
+  // buffers (svc, entity, kv values) MUST outlive the synchronous
+  // send_homeassistant_action() call below — they are function-scope locals, so
+  // they do.
+  std::string svc = "light.turn_on";
+  std::string entity = this->entity_id_;
+  std::string pct_val = std::to_string((unsigned) pct);
   char tr_buf[16];
   snprintf(tr_buf, sizeof(tr_buf), "%g", this->transition_s_);  // "0.5"
-  api::HomeAssistantServiceCallAction<> act(api::global_api_server, false);
-  act.set_service("light.turn_on");
-  act.init_data(3);  // MUST equal the add_data count below
-  act.add_data("entity_id", this->entity_id_);           // const char* -> STATIC_STRING
-  act.add_data("brightness_pct", std::string(pct_buf));  // std::string -> VALUE
-  act.add_data("transition", std::string(tr_buf));       // std::string -> VALUE
-  act.play_complex();
+  std::string tr_val = tr_buf;
+  std::string k_entity = "entity_id", k_pct = "brightness_pct", k_tr = "transition";
+
+  api::HomeassistantActionRequest req;
+  req.service = esphome::StringRef(svc);
+  req.is_event = false;
+  req.data.init(3);
+  { auto &kv = req.data.emplace_back(); kv.key = esphome::StringRef(k_entity); kv.value = esphome::StringRef(entity); }
+  { auto &kv = req.data.emplace_back(); kv.key = esphome::StringRef(k_pct);    kv.value = esphome::StringRef(pct_val); }
+  { auto &kv = req.data.emplace_back(); kv.key = esphome::StringRef(k_tr);     kv.value = esphome::StringRef(tr_val); }
+  api::global_api_server->send_homeassistant_action(req);
 #endif
 }
 
@@ -127,14 +143,24 @@ void HaLightDimmer::call_turn_off_() {
   this->pending_pct_ = 0;
   this->pending_set_ms_ = millis();
 #if defined(USE_API) && defined(USE_API_HOMEASSISTANT_SERVICES)
+  if (api::global_api_server == nullptr)
+    return;
+  // See call_turn_on_ for the 2026.10.0 direct-request rationale and the
+  // StringRef lifetime requirement (all backing strings are function-scope).
+  std::string svc = "light.turn_off";
+  std::string entity = this->entity_id_;
   char tr_buf[16];
   snprintf(tr_buf, sizeof(tr_buf), "%g", this->transition_s_);
-  api::HomeAssistantServiceCallAction<> act(api::global_api_server, false);
-  act.set_service("light.turn_off");
-  act.init_data(2);  // MUST equal the add_data count below
-  act.add_data("entity_id", this->entity_id_);
-  act.add_data("transition", std::string(tr_buf));
-  act.play_complex();
+  std::string tr_val = tr_buf;
+  std::string k_entity = "entity_id", k_tr = "transition";
+
+  api::HomeassistantActionRequest req;
+  req.service = esphome::StringRef(svc);
+  req.is_event = false;
+  req.data.init(2);
+  { auto &kv = req.data.emplace_back(); kv.key = esphome::StringRef(k_entity); kv.value = esphome::StringRef(entity); }
+  { auto &kv = req.data.emplace_back(); kv.key = esphome::StringRef(k_tr);     kv.value = esphome::StringRef(tr_val); }
+  api::global_api_server->send_homeassistant_action(req);
 #endif
 }
 
