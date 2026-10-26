@@ -12,6 +12,10 @@ static constexpr float POS_EPSILON = 0.005f;
 
 void ShutterGroup::setup() {
   this->update_state(true);
+  // Publish the initial "overridden" state (false at boot; flags default
+  // false). setup runs at setup_priority::LATE, after codegen wiring, so
+  // overridden_sensor_ is set.
+  this->publish_overridden();
 }
 
 void ShutterGroup::dump_config() {
@@ -46,6 +50,7 @@ void ShutterGroup::control(const cover::CoverCall &call) {
     } else {
       this->sunset_cancelled_today = true;
     }
+    this->publish_overridden();
     for (auto *s : shutters_) s->apply_manual_command(d);
   }
 }
@@ -97,42 +102,37 @@ void ShutterGroup::update_state(bool force) {
   this->publish_state();
 }
 
-// Standard debounce: a raw reading must hold steady for >= debounce_ms_
-// before it is promoted to the stable value. Returns the stable value.
-bool ShutterGroup::debounce_(bool raw, bool &raw_prev, uint32_t &raw_changed_ms,
-                             bool &stable, uint32_t now) {
-  if (raw != raw_prev) {
-    raw_prev = raw;
-    raw_changed_ms = now;
-  } else if (raw != stable &&
-             (uint32_t)(now - raw_changed_ms) >= debounce_ms_) {
-    stable = raw;
-  }
-  return stable;
-}
-
 void ShutterGroup::loop() {
+  // Edge-driven: presses are counted in on_wall_up_edge()/on_wall_down_edge()
+  // the instant the coordinator fires the switch's press callback, so the only
+  // remaining job of loop() is the time-based "click window expired -> fire the
+  // accumulated count" check, which must run off a timer because that decision
+  // happens precisely when NO new edge arrives. Each call is a cheap millis()
+  // comparison guarded by a count==0 early-return (see loop_click_), so it is
+  // effectively free when idle.
   const uint32_t now = millis();
-
-  bool u_raw = up_btn_   != nullptr && up_btn_->state;
-  bool d_raw = down_btn_ != nullptr && down_btn_->state;
-
-  // Feed the DEBOUNCED stable state into the edge/click detection below, so a
-  // noisy raw reading can't register as a spurious click.
-  bool u = debounce_(u_raw, up_raw_prev_, up_raw_changed_ms_, up_stable_, now);
-  bool d = debounce_(d_raw, down_raw_prev_, down_raw_changed_ms_, down_stable_,
-                     now);
-
-  if (u && !up_prev_)   on_press_(up_cs_, true, now);
-  if (d && !down_prev_) on_press_(down_cs_, false, now);
-  up_prev_ = u;
-  down_prev_ = d;
-
   loop_click_(up_cs_, true, now);
   loop_click_(down_cs_, false, now);
 }
 
-void ShutterGroup::on_press_(ClickState &cs, bool is_up, uint32_t now) {
+// Press-edge entry points. A press on ANY up switch feeds the shared up
+// click-counter, likewise down (the OR behavior is now realized by binding
+// every switch's add_on_press to the same entry point at codegen).
+void ShutterGroup::on_wall_up_edge()   { accept_edge_(up_cs_, true, millis()); }
+void ShutterGroup::on_wall_down_edge() { accept_edge_(down_cs_, false, millis()); }
+
+// Accept (or drop) one press edge for a direction. The debounce gate drops any
+// edge arriving within debounce_ms_ of the last ACCEPTED edge for this
+// direction, so a single press's bounce burst collapses to exactly one click;
+// an accepted edge advances the click count within the click window, with the
+// triple-click (count >= 3 => stop) handled immediately via the fast path.
+void ShutterGroup::accept_edge_(ClickState &cs, bool is_up, uint32_t now) {
+  if (debounce_ms_ != 0 &&
+      (uint32_t)(now - cs.last_accepted_ms) < debounce_ms_) {
+    return;  // drop bounce edge
+  }
+  cs.last_accepted_ms = now;
+
   if (cs.count > 0 && (uint32_t)(now - cs.last_press_ms) > click_window_ms_) {
     cs.count = 0;
   }
@@ -165,6 +165,7 @@ void ShutterGroup::fire_click_(uint8_t count, bool is_up) {
     } else {
       this->sunset_cancelled_today = true;
     }
+    this->publish_overridden();
     for (auto *s : shutters_) if (hub_ != nullptr) hub_->enqueue(s, d, true);
   } else if (count == 3) {
     if (hub_ != nullptr) hub_->cancel_group(this);
@@ -173,6 +174,11 @@ void ShutterGroup::fire_click_(uint8_t count, bool is_up) {
 
 void ShutterGroup::publish_sun_through(bool on) {
   if (sun_through_sensor_ != nullptr) sun_through_sensor_->publish_state(on);
+}
+
+void ShutterGroup::publish_overridden() {
+  if (overridden_sensor_ != nullptr)
+    overridden_sensor_->publish_state(this->is_overridden());
 }
 
 bool ShutterGroup::compute_sun_through_raw(float az, float el) const {

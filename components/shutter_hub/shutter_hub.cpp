@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/application.h"
+#include "esphome/core/time.h"
 #include <algorithm>
 #include <cstring>
 
@@ -27,6 +28,16 @@ static constexpr uint32_t POSITIONS_PREF_HASH = 0x5A00F00D;
 void ShutterHub::setup() {
   ESP_LOGCONFIG(TAG, "Shutter hub ready: %u shutters, %u groups",
                 (unsigned) shutters_.size(), (unsigned) groups_.size());
+
+  // Re-evaluate sun-through whenever either sun sensor publishes a new value.
+  // This internalizes what used to be two YAML `sensor: platform: sun`
+  // `on_value: lambda: id(shutterhub).on_sun_update();` triggers, so the user
+  // no longer needs those lambdas. Event-driven off the sun sensor updates
+  // (no polling added). Guarded so a missing sensor is a no-op.
+  if (this->sun_az_ != nullptr)
+    this->sun_az_->add_on_state_callback([this](float) { this->on_sun_update(); });
+  if (this->sun_el_ != nullptr)
+    this->sun_el_->add_on_state_callback([this](float) { this->on_sun_update(); });
 }
 
 void ShutterHub::ensure_positions_loaded_() {
@@ -138,6 +149,56 @@ void ShutterHub::loop() {
     }
   }
 
+  // Daily housekeeping + scheduled backup open. Clock check only, no I2C.
+  if (time_ != nullptr) {
+    auto t = time_->now();
+    if (t.is_valid()) {
+      // Day rollover: reset the per-group daily-cancel flags AND re-arm the
+      // backup-open latch, exactly once when a new calendar day begins. This is
+      // internal now — no external midnight on_time trigger is required. The
+      // latch re-arm lives HERE (not in reset_daily_flags()) so it only happens
+      // at the true rollover, where the clock is at ~00:00 (before
+      // backup_open_time) and the backup open therefore waits for the configured
+      // time rather than firing immediately. The manual "Clear Overrides" button
+      // also calls reset_daily_flags() but must NOT re-arm the latch (it can be
+      // pressed after backup_open_time, which would fire the open retroactively).
+      // Guarded so it runs once per day.
+      if ((int16_t) t.day_of_year != reset_last_day_) {
+        const bool first_sync = (reset_last_day_ == -1);
+        reset_last_day_ = (int16_t) t.day_of_year;
+        this->reset_daily_flags();
+        // Re-arm the backup-open latch for the new day. EXCEPT on the very first
+        // clock sync after boot: if the device boots/syncs AFTER backup_open_time
+        // (e.g. a reboot in the evening), arming it would make the backup open
+        // fire retroactively and open shutters at night. On first sync, only arm
+        // if we are still BEFORE the configured time today; otherwise treat it as
+        // already fired for today. True midnight rollovers always arm (00:00 is
+        // before any sane backup_open_time).
+        if (first_sync && backup_open_hour_ != 255) {
+          uint16_t now_minutes = (uint16_t) t.hour * 60 + t.minute;
+          uint16_t target_minutes =
+              (uint16_t) backup_open_hour_ * 60 + backup_open_minute_;
+          this->backup_open_fired_today_ = (now_minutes >= target_minutes);
+        } else {
+          this->backup_open_fired_today_ = false;
+        }
+      }
+
+      // Feature 1: scheduled backup open. Inert until set_backup_open_time() is
+      // called (hour stays 255). Fires at most once per day via the latch that
+      // reset_daily_flags() re-armed at the day rollover above.
+      if (backup_open_hour_ != 255 && !backup_open_fired_today_) {
+        uint16_t now_minutes = (uint16_t) t.hour * 60 + t.minute;
+        uint16_t target_minutes =
+            (uint16_t) backup_open_hour_ * 60 + backup_open_minute_;
+        if (now_minutes >= target_minutes) {
+          this->maybe_backup_open_();
+          backup_open_fired_today_ = true;
+        }
+      }
+    }
+  }
+
   switch (state_) {
     case HubState::IDLE:
       if (!queue_.empty()) this->begin_request_();
@@ -174,6 +235,15 @@ void ShutterHub::begin_request_() {
   queue_.pop_front();
   active_ = r.shutter;
   active_dir_ = r.dir;
+  // CRASH BREADCRUMB (low volume: once per movement start). We've seen a rare
+  // (~weekly) StoreProhibited null write; this records which shutter is about to
+  // be driven RIGHT BEFORE the dereferences below, so if the crash is here the
+  // last log line names the shutter (and an active_==nullptr here would be the
+  // smoking gun — a null Request.shutter). Deliberately NOT guarded: the user
+  // wants it to crash so the esp32.crash backtrace + uptime reset are visible.
+  ESP_LOGD(TAG, "begin_request_: active_=%p dir=%s queue_remaining=%u",
+           (void *) active_, active_dir_ == Dir::UP ? "UP" : "DOWN",
+           (unsigned) queue_.size());
   active_start_pos_ = active_->position_known ? active_->position
                        : (r.dir == Dir::UP ? 0.0f : 1.0f);
   float target = (r.dir == Dir::UP) ? 1.0f : 0.0f;
@@ -230,12 +300,47 @@ void ShutterHub::enqueue(Shutter *s, Dir d, bool from_wall_switch) {
       std::remove_if(queue_.begin(), queue_.end(),
                      [s](const Request &r) { return r.shutter == s; }),
       queue_.end());
+
+  // Skip a command for a shutter already at the commanded limit, mirroring the
+  // sun-automation paths (which skip members with position >= 0.99 for UP /
+  // <= 0.01 for DOWN). Without this, a double-click UP on a fully-open shutter
+  // (or DOWN on a fully-closed one) fired a pointless ~50ms relay pulse via the
+  // minimum-duration clamp in begin_request_(). We only skip when the shutter
+  // is NOT the active mover: a mid-travel reverse (active_ == s, opposite dir)
+  // is at an intermediate position, not at the target limit, so this check is
+  // naturally false for it and the reverse still works. position_known guard:
+  // if we don't actually know the position, don't skip (let it run so the user
+  // can still command it).
+  if (active_ != s && s->position_known) {
+    if (d == Dir::UP && s->position >= 0.99f) {
+      return;
+    }
+    if (d == Dir::DOWN && s->position <= 0.01f) {
+      return;
+    }
+  }
+
   if (active_ == s) {
     if (active_dir_ == d) return;
     stop_active();
+    // A mid-travel reverse stops the active mover and immediately enqueues the
+    // opposite-direction request below. finalize_active_() (called by
+    // stop_active()) picked IDLE because the queue was still empty at that
+    // instant, which would let the reverse start with no quiet gap. Force
+    // COOLDOWN here so the full INTER_REQUEST_DELAY_MS elapses before the
+    // reversing relay is driven (UX + I2C-crash mitigation). The genuine
+    // empty-queue fast-IDLE path (travel finished, plain stop) does not go
+    // through enqueue() and is unaffected.
+    state_ = HubState::COOLDOWN;
+    state_start_ms_ = millis();
   } else if (active_ != nullptr && from_wall_switch) {
     Request preempted{active_, active_dir_, false};
     stop_active();  // resets preempted shutter's icon to IDLE
+    // Same reasoning as the reverse path: preempting a DIFFERENT moving group
+    // from a wall switch stops the active mover and enqueues new work in this
+    // same call, so honor the quiet inter-request window before the next relay.
+    state_ = HubState::COOLDOWN;
+    state_start_ms_ = millis();
     queue_.push_front(preempted);
     // Re-mark the preempted shutter as queued so it keeps showing its
     // (resume) direction icon while it waits for its turn again.
@@ -379,6 +484,41 @@ bool ShutterHub::sun_through_active(ShutterGroup *g) {
   return g->compute_sun_through_raw(az, el);
 }
 
+void ShutterHub::maybe_backup_open_() {
+  // Backup open: for groups that close at sunset but do NOT open at sunrise,
+  // open any member still closed. Skip the whole group if it was already
+  // opened/cancelled today or is currently closed by sun-through. Movement is
+  // one shutter at a time through the hub queue, mirroring schedule_sunrise_open.
+  ESP_LOGI(TAG, "Backup open: checking groups at %02u:%02u",
+           (unsigned) backup_open_hour_, (unsigned) backup_open_minute_);
+  for (auto *g : groups_) {
+    if (!g->close_at_sunset() || g->open_at_sunrise()) continue;
+    if (g->sunrise_cancelled_today || g->closed_by_sun_through) continue;
+    for (auto *s : g->shutters()) {
+      // Only open members that are currently closed; skip the rest.
+      if (!(s->position_known && s->position <= 0.01f)) continue;
+      this->enqueue(s, Dir::UP, false);
+    }
+    // Treat the backup open as the morning open having happened for this group.
+    g->sunrise_cancelled_today = true;
+  }
+}
+
+void ShutterHub::open_all_closed_no_override() {
+  // Open every currently-closed shutter across all groups EXCEPT groups closed
+  // by sun-through or already opened/cancelled today. One shutter at a time
+  // through the hub queue; never drives relays directly.
+  ESP_LOGI(TAG, "Open-all: opening all closed shutters (no override)");
+  for (auto *g : groups_) {
+    if (g->closed_by_sun_through) continue;
+    if (g->sunrise_cancelled_today) continue;
+    for (auto *s : g->shutters()) {
+      if (!(s->position_known && s->position <= 0.01f)) continue;
+      this->enqueue(s, Dir::UP, false);
+    }
+  }
+}
+
 void ShutterHub::schedule_sunrise_open() {
   for (auto *g : groups_) {
     if (!g->open_at_sunrise() || g->sunrise_cancelled_today) continue;
@@ -413,36 +553,86 @@ void ShutterHub::on_sun_update() {
     bool active = this->sun_through_active(g);
     g->publish_sun_through(active);
     if (!g->close_on_sun_through()) continue;
-    if (g->sun_through_cancelled_today) continue;
-    if (this->heating_needed_on()) continue;
-    if (active && !g->closed_by_sun_through) {
+    // For the cancelled / heating paths we take no sun-through ACTION, but we
+    // still track the edge so that when the suppression clears, the NEXT update
+    // does not see a stale prev-active and fire a spurious reopen.
+    if (g->sun_through_cancelled_today || this->heating_needed_on()) {
+      g->sun_through_prev_active_ = active;
+      continue;
+    }
+    if (active) {
+      // Sun is shining through: close any member not already closed. Only set
+      // closed_by_sun_through when we ACTUALLY enqueued a close — previously it
+      // was set unconditionally, so a shutter already closed from the prior
+      // sunset got falsely flagged as "closed by sun-through". With the reopen
+      // logic below no longer depending on that flag this is just hygiene, but
+      // it keeps the flag honest for telemetry/other logic.
+      bool closed_any = false;
       for (auto *s : g->shutters()) {
-        // Option (b): skip members already closed.
-        if (s->position_known && s->position <= 0.01f) continue;
+        if (s->position_known && s->position <= 0.01f) continue;  // already closed
         this->enqueue(s, Dir::DOWN, false);
+        closed_any = true;
       }
-      g->closed_by_sun_through = true;
-    } else if (!active && g->closed_by_sun_through) {
+      if (closed_any)
+        g->closed_by_sun_through = true;
+    } else {
+      // Sun-through has ended. Reopen if this is a daylight-open group
+      // (open_at_sunrise), there is still meaningful daylight left
+      // (el > elevation_margin), and the user has not manually overridden the
+      // group today. This is INDEPENDENT of closed_by_sun_through and of
+      // close_at_sunset: it performs the daytime open that may have been
+      // suppressed at sunrise (suppress_sunrise_if_sun_through) and never
+      // retried, OR reverses a sun-through close. The elevation gate naturally
+      // lets an EAST window reopen (sun still high when its morning sun-through
+      // ends) while preventing a pointless dusk reopen on a WEST window (sun
+      // already low when its afternoon sun-through ends, just before the
+      // sunset close).
       float el = this->sun_elevation();
-      if (!g->close_at_sunset() && !std::isnan(el) &&
-          el > g->elevation_margin()) {
+      // EDGE GATE: only reopen on a genuine active->inactive transition
+      // (sun_through_prev_active_ was true), NOT on any standalone inactive
+      // reading. This is what fixes the reboot glitch: at boot (or while the sun
+      // sensors are still settling, az/el briefly NaN -> active=false) there is
+      // no prior active state, so no edge, so a sun-through-closed shutter is
+      // NOT spuriously opened-then-closed. It also matches the real intent:
+      // reopen WHEN the sun stops shining through, not merely whenever it isn't.
+      //
+      // is_overridden() covers ANY manual command today (manual open/close or
+      // sun_through cancel), so a shutter the user deliberately closed mid-day
+      // is not reopened. The elevation gate lets EAST reopen at midday while
+      // preventing a pointless WEST dusk reopen.
+      if (g->sun_through_prev_active_ && g->open_at_sunrise() &&
+          !g->is_overridden() && !std::isnan(el) && el > g->elevation_margin()) {
         for (auto *s : g->shutters()) {
-          // Option (b): skip members already open.
-          if (s->position_known && s->position >= 0.99f) continue;
+          if (s->position_known && s->position >= 0.99f) continue;  // already open
           this->enqueue(s, Dir::UP, false);
         }
       }
       g->closed_by_sun_through = false;
     }
+    // Record this reading for the next update's edge detection.
+    g->sun_through_prev_active_ = active;
   }
 }
 
 void ShutterHub::reset_daily_flags() {
+  // Clears the per-group manual-override / sun-through daily flags and
+  // republishes the override sensors. Called in TWO situations:
+  //   1. the internal midnight day-rollover (loop()), and
+  //   2. the manual "Clear Shutter Overrides" button, which can be pressed at
+  //      ANY time of day.
+  // It deliberately does NOT re-arm the backup-open latch
+  // (backup_open_fired_today_). Re-arming is done ONLY by the day-rollover in
+  // loop(), where it is safe because the clock is at 00:00 (before the configured
+  // backup_open_time). Re-arming here would let the button retroactively trigger
+  // the backup open: pressing it in the evening (now >= backup_open_time) would
+  // immediately open every close-at-sunset/not-open-at-sunrise shutter — the bug
+  // observed when the button opened shutters at night.
   for (auto *g : groups_) {
     g->sunrise_cancelled_today     = false;
     g->sunset_cancelled_today      = false;
     g->sun_through_cancelled_today = false;
     g->closed_by_sun_through       = false;
+    g->publish_overridden();
   }
   ESP_LOGD(TAG, "Daily flags reset");
 }

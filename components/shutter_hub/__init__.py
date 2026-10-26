@@ -3,7 +3,7 @@ import esphome.config_validation as cv
 from esphome import automation
 from esphome.components import (
     cover, binary_sensor, sensor, text_sensor, sun, switch as switch_,
-    time as time_,
+    time as time_, button,
 )
 from esphome.const import CONF_ID, CONF_NAME, CONF_DEVICE_CLASS
 from esphome.core import CORE, ID
@@ -17,6 +17,8 @@ ns = cg.esphome_ns.namespace("shutter_hub")
 ShutterHub   = ns.class_("ShutterHub", cg.Component)
 Shutter      = ns.class_("Shutter", cover.Cover, cg.Component)
 ShutterGroup = ns.class_("ShutterGroup", cover.Cover, cg.Component)
+OpenAllButton = ns.class_("OpenAllButton", button.Button)
+ClearOverridesButton = ns.class_("ClearOverridesButton", button.Button)
 
 WindowOrientation = ns.enum("WindowOrientation", True)
 WINDOW_ORIENTATIONS = {"EAST": WindowOrientation.EAST, "WEST": WindowOrientation.WEST}
@@ -50,6 +52,42 @@ CONF_RESTORE             = "restore"
 CONF_TIME_ID             = "time_id"
 CONF_STATUS_SENSOR       = "status_sensor"
 CONF_POSITION_SENSOR     = "position_sensor"
+CONF_BACKUP_OPEN_TIME    = "backup_open_time"
+CONF_OPEN_ALL_BUTTON     = "open_all_button"
+CONF_CLEAR_OVERRIDES_BUTTON = "clear_overrides_button"
+
+DEFAULT_OPEN_ALL_BUTTON_NAME = "Open All Shutters"
+DEFAULT_CLEAR_OVERRIDES_BUTTON_NAME = "Clear Shutter Overrides"
+
+
+def _parse_hhmm(value):
+    """Parse a plain "HH:MM" (seconds optional) time-of-day into (hour, minute).
+
+    Only hour and minute are used by Feature 1; any seconds component is parsed
+    for tolerance but ignored. Raises cv.Invalid on malformed input or ranges.
+    """
+    text = cv.string(value).strip()
+    parts = text.split(":")
+    if len(parts) not in (2, 3):
+        raise cv.Invalid(
+            f"'{CONF_BACKUP_OPEN_TIME}' must be HH:MM or HH:MM:SS, got '{text}'."
+        )
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+        if len(parts) == 3:
+            int(parts[2])  # validate seconds are numeric; value unused
+    except ValueError:
+        raise cv.Invalid(
+            f"'{CONF_BACKUP_OPEN_TIME}' must be numeric HH:MM(:SS), got '{text}'."
+        )
+    if not (0 <= hour <= 23):
+        raise cv.Invalid(f"'{CONF_BACKUP_OPEN_TIME}' hour must be 0..23, got {hour}.")
+    if not (0 <= minute <= 59):
+        raise cv.Invalid(
+            f"'{CONF_BACKUP_OPEN_TIME}' minute must be 0..59, got {minute}."
+        )
+    return hour, minute
 
 WINDOW_SCHEMA = cv.Schema({
     cv.Required(CONF_W): cv.positive_float,
@@ -78,11 +116,24 @@ SHUTTER_SCHEMA = cover.cover_schema(Shutter).extend({
 # no physical wall-switch control.
 GROUP_SCHEMA = cover.cover_schema(ShutterGroup).extend({
     cv.Optional(CONF_DEVICE_CLASS, default="shutter"): cv.string,
-    cv.Optional(CONF_WALL_UP): cv.use_id(binary_sensor.BinarySensor),
-    cv.Optional(CONF_WALL_DOWN): cv.use_id(binary_sensor.BinarySensor),
+    # wall_up / wall_down accept a binary_sensor reference. When shutter_hub is
+    # nested in mcp23017_shared_int (the normal case), these reference the
+    # board-generated input sensors ("has_board<bb>_chip<cc>_pin<pp>"), which are
+    # fabricated at CODEGEN and so do NOT exist at validation time — a plain
+    # cv.use_id would fail with "Couldn't find ID". We therefore accept a string
+    # here and resolve it via the button_resolver passed into build_shutter_hub
+    # (which looks the id up in the board-generated sensor map), mirroring how
+    # up_relay/down_relay are resolved against the switch map. In the standalone
+    # (non-nested) case the resolver falls back to cg.get_variable, so a normal
+    # YAML-declared binary_sensor id still works.
+    # One OR MORE wall switches per direction (like a light's on_buttons list).
+    # cv.ensure_list accepts a single string ("has_board..._pin..") or a list of
+    # them; a press on any up switch drives the group up, any down switch down.
+    cv.Optional(CONF_WALL_UP): cv.ensure_list(cv.string_strict),
+    cv.Optional(CONF_WALL_DOWN): cv.ensure_list(cv.string_strict),
     cv.Required(CONF_SHUTTERS): cv.ensure_list(cv.use_id(Shutter)),
     cv.Optional(CONF_CLICK_WIN, default="400ms"): cv.positive_time_period_milliseconds,
-    cv.Optional(CONF_DEBOUNCE, default="20ms"): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_DEBOUNCE, default="80ms"): cv.positive_time_period_milliseconds,
     # Sun-based automation now lives on the group (moved from the shutter).
     # All actions default off, so an unconfigured group does nothing.
     cv.Optional(CONF_OPEN_AT_SUNRISE, default=False): cv.boolean,
@@ -93,7 +144,9 @@ GROUP_SCHEMA = cover.cover_schema(ShutterGroup).extend({
     cv.Optional(CONF_SUPPRESS_SUNRISE, default=True): cv.boolean,
     cv.Optional(CONF_WINDOW): WINDOW_SCHEMA,
     cv.Optional(CONF_SUN_THROUGH_SENSOR): cv.use_id(binary_sensor.BinarySensor),
-})
+# ShutterGroup is a Component (loop() does wall-switch click counting), so the
+# group schema must carry the component keys that cg.register_component reads.
+}).extend(cv.COMPONENT_SCHEMA)
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(ShutterHub),
@@ -129,6 +182,21 @@ NESTED_CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
     cv.Required(CONF_SHUTTERS): cv.ensure_list(NESTED_SHUTTER_SCHEMA),
     cv.Optional(CONF_GROUPS, default=[]): cv.ensure_list(GROUP_SCHEMA),
+    # Feature 1: single global time-of-day for the scheduled backup open.
+    cv.Optional(CONF_BACKUP_OPEN_TIME): _parse_hhmm,
+    # Feature 2: optional Open-All button. Accepts `{}` or `{name: ...}`.
+    cv.Optional(CONF_OPEN_ALL_BUTTON): button.button_schema(
+        OpenAllButton, icon="mdi:window-shutter-open"
+    ).extend({
+        cv.Optional(CONF_NAME, default=DEFAULT_OPEN_ALL_BUTTON_NAME): cv.string,
+    }),
+    # Feature 2 (overrides): optional Clear-Overrides button. Accepts `{}` or
+    # `{name: ...}`. Pressing it is a manual reset_daily_flags().
+    cv.Optional(CONF_CLEAR_OVERRIDES_BUTTON): button.button_schema(
+        ClearOverridesButton, icon="mdi:restore"
+    ).extend({
+        cv.Optional(CONF_NAME, default=DEFAULT_CLEAR_OVERRIDES_BUTTON_NAME): cv.string,
+    }),
 }).extend(cv.COMPONENT_SCHEMA)
 
 
@@ -155,7 +223,7 @@ async def to_code(config):
     await build_shutter_hub(config)
 
 
-async def build_shutter_hub(config, relay_resolver=None):
+async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
     """Generate the full ShutterHub graph (hub, shutters, groups, telemetry).
 
     Shared by the standalone `shutter_hub:` component and by
@@ -169,6 +237,15 @@ async def build_shutter_hub(config, relay_resolver=None):
     """
     if relay_resolver is None:
         async def relay_resolver(ref):
+            return await cg.get_variable(ref)
+
+    # button_resolver maps a wall_up/wall_down reference to the binary_sensor var.
+    # Standalone: resolve a normal YAML-declared binary_sensor id via get_variable.
+    # Nested in mcp23017_shared_int: a "has_board..._pin.." string resolved against
+    # the board-generated input sensor map (fabricated at codegen, so not
+    # resolvable by validation-phase use_id).
+    if button_resolver is None:
+        async def button_resolver(ref):
             return await cg.get_variable(ref)
 
     var = cg.new_Pvariable(config[CONF_ID])
@@ -218,11 +295,29 @@ async def build_shutter_hub(config, relay_resolver=None):
 
     for g in config[CONF_GROUPS]:
         gv = await cover.new_cover(g)
+        # ShutterGroup is a Component (its loop() does all wall-switch click
+        # counting) as well as a Cover entity. cover.new_cover() registers only
+        # the entity, NOT the component, so without this call ESPHome never ran
+        # the group's setup()/loop() and wall-switch clicks were silently never
+        # counted (HA commands still worked because those go through control()).
+        await cg.register_component(gv, g)
         cg.add(gv.set_hub(var))
-        if CONF_WALL_UP in g:
-            cg.add(gv.set_wall_up(await cg.get_variable(g[CONF_WALL_UP])))
-        if CONF_WALL_DOWN in g:
-            cg.add(gv.set_wall_down(await cg.get_variable(g[CONF_WALL_DOWN])))
+        # Bind each wall switch's press EDGE to the group, mirroring how
+        # ha_light_hub binds on_up_pressed/on_down_pressed. The sensor is kept on
+        # the group (add_wall_up/add_wall_down) AND its add_on_press notifies the
+        # group the instant the coordinator sees the OFF->ON edge, so a bouncy
+        # press's brief ON is never lost between main-loop level samples.
+        gname = str(gv)  # file-scope C++ var name referenced inside the lambdas
+        for ref in g.get(CONF_WALL_UP, []):
+            sv = await button_resolver(ref)
+            cg.add(gv.add_wall_up(sv))
+            cg.add(sv.add_on_press(
+                cg.RawExpression(f"[]() {{ {gname}->on_wall_up_edge(); }}")))
+        for ref in g.get(CONF_WALL_DOWN, []):
+            sv = await button_resolver(ref)
+            cg.add(gv.add_wall_down(sv))
+            cg.add(sv.add_on_press(
+                cg.RawExpression(f"[]() {{ {gname}->on_wall_down_edge(); }}")))
         cg.add(gv.set_click_window(g[CONF_CLICK_WIN]))
         cg.add(gv.set_debounce(g[CONF_DEBOUNCE]))
         cg.add(gv.set_open_at_sunrise(g[CONF_OPEN_AT_SUNRISE]))
@@ -238,6 +333,50 @@ async def build_shutter_hub(config, relay_resolver=None):
         if CONF_SUN_THROUGH_SENSOR in g:
             cg.add(gv.set_sun_through_sensor(
                 await cg.get_variable(g[CONF_SUN_THROUGH_SENSOR])))
+        # Per-group "overridden today" binary_sensor, fabricated at codegen the
+        # same way the per-shutter telemetry entities are (always on, no config).
+        # A plain binary_sensor::BinarySensor (EntityBase only), registered via
+        # App.register_binary_sensor, NOT a counted Component.
+        group_name = g.get(CONF_NAME) or str(g[CONF_ID])
+        ov_conf = binary_sensor.binary_sensor_schema(
+            icon="mdi:gesture-tap",
+        )({
+            CONF_ID: _declare_entity_id(
+                f"{g[CONF_ID]}_overridden", binary_sensor.BinarySensor),
+            CONF_NAME: f"{group_name} Overridden",
+        })
+        ov = await binary_sensor.new_binary_sensor(ov_conf)
+        cg.add(gv.set_overridden_sensor(ov))
         for sh in g[CONF_SHUTTERS]:
             cg.add(gv.add_shutter(await cg.get_variable(sh)))
         cg.add(var.add_group(gv))
+
+    # Feature 1: scheduled backup open. The value is already parsed to
+    # (hour, minute) by _parse_hhmm during validation. Requires a time source.
+    if CONF_BACKUP_OPEN_TIME in config:
+        if CONF_TIME_ID not in config:
+            raise cv.Invalid(
+                f"'{CONF_BACKUP_OPEN_TIME}' requires a '{CONF_TIME_ID}:' "
+                "(RealTimeClock) to be configured."
+            )
+        hour, minute = config[CONF_BACKUP_OPEN_TIME]
+        cg.add(var.set_backup_open_time(hour, minute))
+
+    # Feature 2: Open-All button. The button is a button::Button (EntityBase
+    # only), registered via App.register_button, so it is NOT a counted
+    # component and needs no fabricated-id entry.
+    if CONF_OPEN_ALL_BUTTON in config:
+        btn = await button.new_button(config[CONF_OPEN_ALL_BUTTON])
+        cg.add(btn.set_hub(var))
+
+    # Feature 2 (overrides): Clear-Overrides button. Like the Open-All button it
+    # is a button::Button (EntityBase only), registered via App.register_button,
+    # so it is NOT a counted component and needs no fabricated-id entry. Pressing
+    # it runs a manual reset_daily_flags().
+    if CONF_CLEAR_OVERRIDES_BUTTON in config:
+        btn = await button.new_button(config[CONF_CLEAR_OVERRIDES_BUTTON])
+        cg.add(btn.set_hub(var))
+
+    # Expose the hub var so an embedding component (mcp23017_shared_int) can wire
+    # it into its sun_schedule handler. The standalone to_code ignores the return.
+    return var
