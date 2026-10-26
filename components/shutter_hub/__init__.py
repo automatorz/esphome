@@ -156,6 +156,21 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_TIME_ID): cv.use_id(time_.RealTimeClock),
     cv.Required(CONF_SHUTTERS): cv.ensure_list(SHUTTER_SCHEMA),
     cv.Optional(CONF_GROUPS, default=[]): cv.ensure_list(GROUP_SCHEMA),
+    # Feature 1: single global time-of-day for the scheduled backup open.
+    cv.Optional(CONF_BACKUP_OPEN_TIME): _parse_hhmm,
+    # Feature 2: optional Open-All button. Accepts `{}` or `{name: ...}`.
+    cv.Optional(CONF_OPEN_ALL_BUTTON): button.button_schema(
+        OpenAllButton, icon="mdi:window-shutter-open"
+    ).extend({
+        cv.Optional(CONF_NAME, default=DEFAULT_OPEN_ALL_BUTTON_NAME): cv.string,
+    }),
+    # Feature 2 (overrides): optional Clear-Overrides button. Accepts `{}` or
+    # `{name: ...}`. Pressing it is a manual reset_daily_flags().
+    cv.Optional(CONF_CLEAR_OVERRIDES_BUTTON): button.button_schema(
+        ClearOverridesButton, icon="mdi:restore"
+    ).extend({
+        cv.Optional(CONF_NAME, default=DEFAULT_CLEAR_OVERRIDES_BUTTON_NAME): cv.string,
+    }),
 }).extend(cv.COMPONENT_SCHEMA)
 
 
