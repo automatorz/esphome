@@ -246,7 +246,14 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
     # resolvable by validation-phase use_id).
     if button_resolver is None:
         async def button_resolver(ref):
-            return await cg.get_variable(ref)
+            # Standalone: wall_up/wall_down are bare id strings (GROUP_SCHEMA
+            # validates them as cv.string_strict so the nested
+            # mcp23017_shared_int path can use codegen-fabricated ids). Here the
+            # referenced binary_sensor is a real, validation-time entity, so wrap
+            # the string into an ID of the right type before cg.get_variable
+            # (which requires an ID, not a str).
+            return await cg.get_variable(
+                ID(ref, is_declaration=False, type=binary_sensor.BinarySensor))
 
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -302,22 +309,27 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
         # counted (HA commands still worked because those go through control()).
         await cg.register_component(gv, g)
         cg.add(gv.set_hub(var))
-        # Bind each wall switch's press EDGE to the group, mirroring how
-        # ha_light_hub binds on_up_pressed/on_down_pressed. The sensor is kept on
-        # the group (add_wall_up/add_wall_down) AND its add_on_press notifies the
-        # group the instant the coordinator sees the OFF->ON edge, so a bouncy
-        # press's brief ON is never lost between main-loop level samples.
+        # Bind each wall switch's press EDGE to the group. The sensor is kept on
+        # the group (add_wall_up/add_wall_down) AND its state callback notifies
+        # the group the instant it sees the OFF->ON edge, so a bouncy press's
+        # brief ON is never lost between main-loop level samples.
+        #
+        # We use add_on_state_callback (a binary_sensor::BinarySensor base-class
+        # method, so it works for stock gpio sensors AND the fabricated
+        # mcp23017_shared_int sensors alike) with an `if (s)` guard so the group
+        # is notified only on the ON (press) edge, not on release — matching the
+        # press-edge-only semantics and avoiding double counting.
         gname = str(gv)  # file-scope C++ var name referenced inside the lambdas
         for ref in g.get(CONF_WALL_UP, []):
             sv = await button_resolver(ref)
             cg.add(gv.add_wall_up(sv))
-            cg.add(sv.add_on_press(
-                cg.RawExpression(f"[]() {{ {gname}->on_wall_up_edge(); }}")))
+            cg.add(sv.add_on_state_callback(
+                cg.RawExpression(f"[](bool s) {{ if (s) {gname}->on_wall_up_edge(); }}")))
         for ref in g.get(CONF_WALL_DOWN, []):
             sv = await button_resolver(ref)
             cg.add(gv.add_wall_down(sv))
-            cg.add(sv.add_on_press(
-                cg.RawExpression(f"[]() {{ {gname}->on_wall_down_edge(); }}")))
+            cg.add(sv.add_on_state_callback(
+                cg.RawExpression(f"[](bool s) {{ if (s) {gname}->on_wall_down_edge(); }}")))
         cg.add(gv.set_click_window(g[CONF_CLICK_WIN]))
         cg.add(gv.set_debounce(g[CONF_DEBOUNCE]))
         cg.add(gv.set_open_at_sunrise(g[CONF_OPEN_AT_SUNRISE]))
