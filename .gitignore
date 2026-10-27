@@ -2,5 +2,18 @@
 .agents/
 **/.agents/
 
+# Kiro IDE / agent workspace
+.kiro/
+
 # Local ESPHome config dumps
 esp.yaml
+
+# Local validation harness + build artifacts
+.test/
+.trash/
+.esphome-install.log
+
+# Temporary files (probes, scratch, logs)
+.temp/
+probe.txt
+*.tmp
