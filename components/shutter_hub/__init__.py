@@ -5,8 +5,9 @@ from esphome.components import (
     cover, binary_sensor, sensor, text_sensor, sun, switch as switch_,
     time as time_, button,
 )
-from esphome.const import CONF_ID, CONF_NAME, CONF_DEVICE_CLASS
+from esphome.const import CONF_ID, CONF_NAME, CONF_DEVICE_CLASS, CONF_DEVICE_ID
 from esphome.core import CORE, ID
+from esphome.core.config import Device
 from esphome.helpers import sanitize, snake_case
 
 CODEOWNERS = ["@automatorz"]
@@ -150,6 +151,11 @@ GROUP_SCHEMA = cover.cover_schema(ShutterGroup).extend({
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(ShutterHub),
+    # Optional hub-level HA sub-device. When set, EVERY entity this hub creates
+    # (shutter covers, group covers, per-shutter status/position telemetry,
+    # per-group "overridden" binary_sensor, open-all + clear-overrides buttons)
+    # is assigned to this one HA sub-device for cleaner device-page grouping.
+    cv.Optional(CONF_DEVICE_ID): cv.use_id(Device),
     cv.Required(CONF_SUN_AZ): cv.use_id(sensor.Sensor),
     cv.Required(CONF_SUN_EL): cv.use_id(sensor.Sensor),
     cv.Optional(CONF_HEATING): cv.use_id(binary_sensor.BinarySensor),
@@ -191,6 +197,9 @@ NESTED_SHUTTER_SCHEMA = SHUTTER_SCHEMA.extend({
 
 NESTED_CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(ShutterHub),
+    # Same optional hub-level HA sub-device as the standalone schema; required
+    # here for parity so the nested mcp23017_shared_int path also accepts it.
+    cv.Optional(CONF_DEVICE_ID): cv.use_id(Device),
     cv.Required(CONF_SUN_AZ): cv.use_id(sensor.Sensor),
     cv.Required(CONF_SUN_EL): cv.use_id(sensor.Sensor),
     cv.Optional(CONF_HEATING): cv.use_id(binary_sensor.BinarySensor),
@@ -273,6 +282,13 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
+    # Optional hub-level HA sub-device. ID object (from cv.use_id) or None. When
+    # present it is injected into each entity's config dict below BEFORE the
+    # stock new_* helper runs; those helpers' @setup_entity core setup reads
+    # CONF_DEVICE_ID and emits set_device_, grouping every entity under this one
+    # HA sub-device. Strictly a no-op when omitted.
+    dev_id = config.get(CONF_DEVICE_ID)
+
     cg.add(var.set_sun_azimuth(await cg.get_variable(config[CONF_SUN_AZ])))
     cg.add(var.set_sun_elevation(await cg.get_variable(config[CONF_SUN_EL])))
     if CONF_HEATING in config:
@@ -281,6 +297,8 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
         cg.add(var.set_time(await cg.get_variable(config[CONF_TIME_ID])))
 
     for i, s in enumerate(config[CONF_SHUTTERS]):
+        if dev_id is not None:
+            s[CONF_DEVICE_ID] = dev_id
         sv = await cover.new_cover(s)
         cg.add(sv.set_hub(var))
         cg.add(sv.set_index(i))
@@ -298,6 +316,8 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
                     f"{base_name}_status", text_sensor.TextSensor),
                 CONF_NAME: f"{base_name} Status",
             })
+            if dev_id is not None:
+                status_conf[CONF_DEVICE_ID] = dev_id
             status = await text_sensor.new_text_sensor(status_conf)
             cg.add(sv.set_status_sensor(status))
         if s[CONF_POSITION_SENSOR]:
@@ -310,12 +330,16 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
                     f"{base_name}_position", sensor.Sensor),
                 CONF_NAME: f"{base_name} Position",
             })
+            if dev_id is not None:
+                pos_conf[CONF_DEVICE_ID] = dev_id
             pos = await sensor.new_sensor(pos_conf)
             cg.add(sv.set_position_sensor(pos))
 
         cg.add(var.add_shutter(sv))
 
     for g in config[CONF_GROUPS]:
+        if dev_id is not None:
+            g[CONF_DEVICE_ID] = dev_id
         gv = await cover.new_cover(g)
         # ShutterGroup is a Component (its loop() does all wall-switch click
         # counting) as well as a Cover entity. cover.new_cover() registers only
@@ -372,6 +396,8 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
                 f"{g[CONF_ID]}_overridden", binary_sensor.BinarySensor),
             CONF_NAME: f"{group_name} Overridden",
         })
+        if dev_id is not None:
+            ov_conf[CONF_DEVICE_ID] = dev_id
         ov = await binary_sensor.new_binary_sensor(ov_conf)
         cg.add(gv.set_overridden_sensor(ov))
         for sh in g[CONF_SHUTTERS]:
@@ -393,6 +419,8 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
     # only), registered via App.register_button, so it is NOT a counted
     # component and needs no fabricated-id entry.
     if CONF_OPEN_ALL_BUTTON in config:
+        if dev_id is not None:
+            config[CONF_OPEN_ALL_BUTTON][CONF_DEVICE_ID] = dev_id
         btn = await button.new_button(config[CONF_OPEN_ALL_BUTTON])
         cg.add(btn.set_hub(var))
 
@@ -401,6 +429,8 @@ async def build_shutter_hub(config, relay_resolver=None, button_resolver=None):
     # so it is NOT a counted component and needs no fabricated-id entry. Pressing
     # it runs a manual reset_daily_flags().
     if CONF_CLEAR_OVERRIDES_BUTTON in config:
+        if dev_id is not None:
+            config[CONF_CLEAR_OVERRIDES_BUTTON][CONF_DEVICE_ID] = dev_id
         btn = await button.new_button(config[CONF_CLEAR_OVERRIDES_BUTTON])
         cg.add(btn.set_hub(var))
 
