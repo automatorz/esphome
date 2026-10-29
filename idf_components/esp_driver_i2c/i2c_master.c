@@ -38,12 +38,6 @@
 
 static const char *TAG = "i2c.master";
 
-/* VENDORED-PATCH DIAGNOSTIC: counts how many times the defensive NULL guard
-   in i2c_isr_receive_handler fired (each = a StoreProhibited crash averted).
-   Plain volatile uint32_t increment is IRAM-safe (no lock/log/alloc). Exposed
-   as a template sensor in the device config for low-volume reporting. */
-volatile uint32_t g_i2c_null_guard_hits = 0;
-
 #define DIM(array)                (sizeof(array)/sizeof(*array))
 #define I2C_ADDRESS_TRANS_WRITE(device_address)    (((device_address) << 1) | 0)
 #define I2C_ADDRESS_TRANS_READ(device_address)    (((device_address) << 1) | 1)
@@ -752,19 +746,13 @@ I2C_MASTER_ISR_ATTR static void i2c_isr_receive_handler(i2c_master_bus_t *i2c_ma
 
     if (atomic_load(&i2c_master->status) == I2C_STATUS_READ) {
         i2c_operation_t *i2c_operation = &i2c_master->i2c_trans.ops[i2c_master->read_buf_pos];
-        /* DEFENSIVE NULL GUARD (vendored patch, not upstream): under I2C bus
-           corruption from electrical noise the driver state machine can desync
-           so read_buf_pos indexes an operation whose data buffer is NULL (e.g.
-           a START/STOP/WRITE op). The unguarded i2c_ll_read_rxfifo below would
-           then STORE received bytes through NULL -> StoreProhibited panic
-           (PC in i2c_ll_read_rxfifo; see ESP-IDF issue #14476). Instead, fail
-           the transaction: set TIMEOUT status/event and bail. IRAM-safe: only
-           atomic_store + plain field writes, no logging/alloc/blocking, and we
-           return BEFORE taking the spinlock so no lock is leaked. The caller
-           (IDFI2CBus::write_readv) then returns an error that the application
-           already tolerates. */
+        // The receive FIFO can fire after a read has already been torn down (a
+        // timed-out or aborted transfer), leaving the operation's data pointer
+        // NULL. Reading into it would fault. Flag the transfer timed out and
+        // skip the FIFO read. Both status and event must be set so the waiter
+        // and the async dispatcher see the timeout even if MST_COMPLETE already
+        // queued I2C_EVENT_DONE.
         if (i2c_operation->data == NULL) {
-            g_i2c_null_guard_hits++;
             atomic_store(&i2c_master->status, I2C_STATUS_TIMEOUT);
             i2c_master->event = I2C_EVENT_TIMEOUT;
             return;
@@ -789,28 +777,24 @@ I2C_MASTER_ISR_ATTR static void i2c_isr_receive_handler(i2c_master_bus_t *i2c_ma
 #if !SOC_I2C_STOP_INDEPENDENT
     else {
         i2c_operation_t *i2c_operation = &i2c_master->i2c_trans.ops[i2c_master->read_buf_pos];
-        /* DEFENSIVE NULL GUARD (vendored patch, not upstream): under I2C bus
-           corruption from electrical noise the driver state machine can desync
-           so read_buf_pos indexes an operation whose data buffer is NULL (e.g.
-           a START/STOP/WRITE op). The unguarded i2c_ll_read_rxfifo below would
-           then STORE received bytes through NULL -> StoreProhibited panic
-           (PC in i2c_ll_read_rxfifo; see ESP-IDF issue #14476). Instead, fail
-           the transaction: set TIMEOUT status/event and bail. IRAM-safe: only
-           atomic_store + plain field writes, no logging/alloc/blocking, and we
-           return BEFORE taking the spinlock so no lock is leaked. The caller
-           (IDFI2CBus::write_readv) then returns an error that the application
-           already tolerates. */
-        if (i2c_operation->data == NULL) {
-            g_i2c_null_guard_hits++;
+        // Same torn-down-read case as the independent-stop path above: data may
+        // be NULL here. Skip only the FIFO reads to avoid the fault, but still
+        // run the read-complete cleanup below (clearing contains_read) so this
+        // branch is not re-entered on every later END_DETECT/MST_COMPLETE. Set
+        // both status and event so the timeout is observed even if MST_COMPLETE
+        // already queued I2C_EVENT_DONE.
+        bool rx_valid = (i2c_operation->data != NULL);
+        if (!rx_valid) {
             atomic_store(&i2c_master->status, I2C_STATUS_TIMEOUT);
             i2c_master->event = I2C_EVENT_TIMEOUT;
-            return;
         }
         portENTER_CRITICAL_ISR(&i2c_master->base->spinlock);
-        i2c_ll_read_rxfifo(hal->dev, i2c_operation->data + i2c_operation->bytes_used, i2c_master->read_len_static);
-        // If the read command only contain nack marker, no read it for the second time.
-        if (i2c_master->i2c_trans.ops[i2c_master->read_buf_pos + 1].data && i2c_master->i2c_trans.ops[i2c_master->read_buf_pos + 1].hw_cmd.ack_val == I2C_NACK_VAL) {
-            i2c_ll_read_rxfifo(hal->dev, i2c_master->i2c_trans.ops[i2c_master->read_buf_pos + 1].data, 1);
+        if (rx_valid) {
+            i2c_ll_read_rxfifo(hal->dev, i2c_operation->data + i2c_operation->bytes_used, i2c_master->read_len_static);
+            // If the read command only contain nack marker, no read it for the second time.
+            if (i2c_master->i2c_trans.ops[i2c_master->read_buf_pos + 1].data && i2c_master->i2c_trans.ops[i2c_master->read_buf_pos + 1].hw_cmd.ack_val == I2C_NACK_VAL) {
+                i2c_ll_read_rxfifo(hal->dev, i2c_master->i2c_trans.ops[i2c_master->read_buf_pos + 1].data, 1);
+            }
         }
         i2c_master->w_r_size = i2c_master->read_len_static + 1;
         i2c_master->read_len_static = 0;
