@@ -40,8 +40,8 @@ static const char *TAG = "i2c.master";
 
 /* VENDORED-PATCH DIAGNOSTIC: counts how many times the defensive NULL guard
    in i2c_isr_receive_handler fired (each = a StoreProhibited crash averted).
-   Plain volatile uint32_t increment is IRAM-safe (no lock/log/alloc). Read by
-   the ESPHome mcp23017_shared_int component for low-volume reporting. */
+   Plain volatile uint32_t increment is IRAM-safe (no lock/log/alloc). Exposed
+   as a template sensor in the device config for low-volume reporting. */
 volatile uint32_t g_i2c_null_guard_hits = 0;
 
 #define DIM(array)                (sizeof(array)/sizeof(*array))
